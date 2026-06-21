@@ -7,10 +7,21 @@ import (
 
 // Workload describes a container smith should keep running.
 type Workload struct {
-	ID          string       `json:"id"`
-	Image       string       `json:"image"`
-	Args        []string     `json:"args"`
-	HealthCheck *HealthCheck `json:"health_check,omitempty"`
+	ID          string        `json:"id"`
+	Image       string        `json:"image"`
+	Args        []string      `json:"args"`
+	HealthCheck *HealthCheck  `json:"health_check,omitempty"`
+	Ports       []PortMapping `json:"ports,omitempty"`
+}
+
+// PortMapping maps a port on the host node to a port inside the container.
+type PortMapping struct {
+	// HostPort is the port exposed on the agent node's host network.
+	HostPort int `json:"host_port"`
+	// ContainerPort is the port the container process listens on.
+	ContainerPort int `json:"container_port"`
+	// Protocol is "tcp" or "udp". Defaults to "tcp" if empty.
+	Protocol string `json:"protocol,omitempty"`
 }
 
 // HealthCheck defines how smith should probe a running container.
