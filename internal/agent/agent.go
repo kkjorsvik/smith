@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -27,19 +28,31 @@ type Agent struct {
 	serverAddr string
 	client     *smithruntime.Client
 	stop       chan struct{}
+	httpClient *http.Client
+	serverTLS  *tls.Config
 }
 
 // New returns an Agent.
 // id is this node's unique name (e.g. "smith-agent-01").
 // addr is this agent's HTTP address the control plane will call back to (e.g. "192.168.1.55:9000").
-// serverAddr is the control plane's HTTP address (e.g. "192.168.1.54:8080").
-func New(id, addr, serverAddr string, client *smithruntime.Client) *Agent {
+// serverAddr is the control plane's internal mTLS address (e.g. "smith-server-01.kkjorsvik.com:9443").
+// clientTLS authenticates this agent's outbound calls to the control plane;
+// serverTLS requires and verifies client certs on this agent's inbound server.
+func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, serverTLS *tls.Config) *Agent {
+	httpClient := &http.Client{
+		Timeout: serverTimeout,
+		Transport: &http.Transport{
+			TLSClientConfig: clientTLS,
+		},
+	}
 	return &Agent{
 		id:         id,
 		addr:       addr,
 		serverAddr: serverAddr,
 		client:     client,
 		stop:       make(chan struct{}),
+		httpClient: httpClient,
+		serverTLS:  serverTLS,
 	}
 }
 
@@ -51,7 +64,7 @@ func (a *Agent) Start() error {
 	}
 
 	go a.heartbeatLoop()
-	go a.serveHTTP()
+	go a.serveHTTP(a.serverTLS)
 
 	return nil
 }
@@ -77,8 +90,8 @@ func (a *Agent) register() error {
 		return fmt.Errorf("marshal node: %w", err)
 	}
 
-	url := fmt.Sprintf("http://%s/nodes/register", a.serverAddr)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	url := fmt.Sprintf("https://%s/nodes/register", a.serverAddr)
+	resp, err := a.httpClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("post register: %w", err)
 	}
@@ -111,8 +124,8 @@ func (a *Agent) heartbeatLoop() {
 
 // sendHeartbeat notifies the control plane this node is still alive.
 func (a *Agent) sendHeartbeat() error {
-	url := fmt.Sprintf("http://%s/nodes/%s/heartbeat", a.serverAddr, a.id)
-	resp, err := http.Post(url, "application/json", nil)
+	url := fmt.Sprintf("https://%s/nodes/%s/heartbeat", a.serverAddr, a.id)
+	resp, err := a.httpClient.Post(url, "application/json", nil)
 	if err != nil {
 		return fmt.Errorf("post heartbeat: %w", err)
 	}
@@ -127,14 +140,20 @@ func (a *Agent) sendHeartbeat() error {
 
 // serveHTTP starts the agent's HTTP server so the control plane can
 // send assignments and query observed state.
-func (a *Agent) serveHTTP() {
+func (a *Agent) serveHTTP(tlsCfg *tls.Config) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /assign", a.handleAssign)
 	mux.HandleFunc("DELETE /assign/{id}", a.handleUnassign)
 	mux.HandleFunc("GET /status", a.handleStatus)
 
+	server := &http.Server{
+		Addr:      a.addr,
+		Handler:   mux,
+		TLSConfig: tlsCfg,
+	}
+
 	log.Printf("agent: listening on %s", a.addr)
-	if err := http.ListenAndServe(a.addr, mux); err != nil {
+	if err := server.ListenAndServeTLS("", ""); err != nil {
 		log.Fatalf("agent: http server: %v", err)
 	}
 }
