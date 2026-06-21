@@ -7,11 +7,12 @@ import (
 
 // Workload describes a container smith should keep running.
 type Workload struct {
-	ID          string        `json:"id"`
-	Image       string        `json:"image"`
-	Args        []string      `json:"args"`
-	HealthCheck *HealthCheck  `json:"health_check,omitempty"`
-	Ports       []PortMapping `json:"ports,omitempty"`
+	ID          string            `json:"id"`
+	Image       string            `json:"image"`
+	Args        []string          `json:"args"`
+	HealthCheck *HealthCheck      `json:"health_check,omitempty"`
+	Ports       []PortMapping     `json:"ports,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
 }
 
 // PortMapping maps a port on the host node to a port inside the container.
