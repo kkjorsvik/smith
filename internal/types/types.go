@@ -45,3 +45,18 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	d.Duration = dur
 	return nil
 }
+
+// Node represents a worker node registered with the control plane.
+type Node struct {
+	ID            string    `json:"id"`
+	Addr          string    `json:"addr"`
+	LastHeartbeat time.Time `json:"last_heartbeat"`
+	CPU           int       `json:"cpu"`
+	MemoryMB      int       `json:"memory_mb"`
+}
+
+// Assignment represents a workload assigned to a specific node.
+type Assignment struct {
+	WorkloadID string `json:"workload_id"`
+	NodeID     string `json:"node_id"`
+}

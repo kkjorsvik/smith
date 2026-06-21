@@ -1,13 +1,17 @@
 package reconciler
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"log"
-	"sync"
+	"net/http"
 	"time"
 
-	"github.com/containerd/containerd"
 	"github.com/kkjorsvik/smith/internal/health"
+	"github.com/kkjorsvik/smith/internal/registry"
 	"github.com/kkjorsvik/smith/internal/runtime"
+	"github.com/kkjorsvik/smith/internal/scheduler"
 	"github.com/kkjorsvik/smith/internal/types"
 )
 
@@ -19,29 +23,30 @@ type Storer interface {
 	List() (map[string]types.Workload, error)
 }
 
-// Reconciler periodically compares the desired state (from the store)
-// against the observed state (from containerd) and takes action to
-// converge them: starting missing containers, stopping extra ones, and
-// restarting unhealthy ones with exponential backoff.
+// Reconciler periodically reconciles desired workloads against the cluster:
+// it assigns each workload to a node via the scheduler, pushes the assignment
+// to that node's agent over HTTP, and evicts workloads from dead nodes. The
+// agents own container lifecycle locally; the control plane only schedules.
 type Reconciler struct {
-	client   *runtime.Client
-	store    Storer
-	monitor  *health.Monitor
-	interval time.Duration
-	stop     chan struct{}
-	failures map[string]int
-	mu       sync.Mutex
+	client    *runtime.Client
+	store     Storer
+	monitor   *health.Monitor
+	registry  *registry.Registry
+	scheduler *scheduler.Scheduler
+	interval  time.Duration
+	stop      chan struct{}
 }
 
 // New returns a Reconciler that reconciles every interval.
-func New(client *runtime.Client, store Storer, monitor *health.Monitor, interval time.Duration) *Reconciler {
+func New(client *runtime.Client, store Storer, monitor *health.Monitor, reg *registry.Registry, sched *scheduler.Scheduler, interval time.Duration) *Reconciler {
 	return &Reconciler{
-		client:   client,
-		store:    store,
-		monitor:  monitor,
-		interval: interval,
-		stop:     make(chan struct{}),
-		failures: make(map[string]int),
+		client:    client,
+		store:     store,
+		monitor:   monitor,
+		registry:  reg,
+		scheduler: sched,
+		interval:  interval,
+		stop:      make(chan struct{}),
 	}
 }
 
@@ -50,16 +55,7 @@ func (r *Reconciler) Start() {
 	go r.loop()
 }
 
-// ResetFailures resets the restart counter for a workload.
-// Called by the health monitor when a container recovers.
-func (r *Reconciler) ResetFailures(id string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.failures, id)
-}
-
-// Stop halts the reconcile loop. Containers left running are cleaned up by
-// CleanupAll on the next startup.
+// Stop halts the reconcile loop.
 func (r *Reconciler) Stop() {
 	close(r.stop)
 }
@@ -68,116 +64,110 @@ func (r *Reconciler) loop() {
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 
-	r.reconcile()
+	if err := r.reconcile(); err != nil {
+		log.Printf("reconciler: %v", err)
+	}
 	for {
 		select {
 		case <-ticker.C:
-			r.reconcile()
+			if err := r.reconcile(); err != nil {
+				log.Printf("reconciler: %v", err)
+			}
 		case <-r.stop:
 			return
 		}
 	}
 }
 
-// reconcile drives observed state toward desired state for one tick.
-func (r *Reconciler) reconcile() {
+func (r *Reconciler) reconcile() error {
 	desired, err := r.store.List()
 	if err != nil {
-		log.Printf("reconciler: list desired state: %v", err)
-		return
+		return fmt.Errorf("list desired: %w", err)
 	}
 
-	observed, err := r.client.ListRunning()
-	if err != nil {
-		log.Printf("reconciler: list running: %v", err)
-		return
+	// Detect dead nodes and evict their workloads back to unassigned.
+	for _, node := range r.registry.Dead() {
+		evicted := r.scheduler.ReassignNode(node.ID)
+		if len(evicted) > 0 {
+			log.Printf("reconciler: node %s is dead, evicting %d workloads", node.ID, len(evicted))
+		}
+		r.registry.Remove(node.ID)
 	}
 
-	for id, w := range desired {
-		obs, running := observed[id]
-
-		// Not running yet — (re)start it. start() arms the health monitor
-		// once the task is confirmed running.
-		if !running || obs.Status != containerd.Running {
-			log.Printf("reconciler: starting %s", id)
-			r.start(w)
+	// Ensure every desired workload is assigned and running on a node.
+	for _, workload := range desired {
+		assignment, err := r.scheduler.Assign(workload)
+		if err != nil {
+			log.Printf("reconciler: assign %s: %v", workload.ID, err)
 			continue
 		}
 
-		if obs.Status == containerd.Running && !r.monitor.Healthy(id) {
-			r.mu.Lock()
-			r.failures[id]++
-			attempt := r.failures[id]
-			r.mu.Unlock()
+		node, exists := r.registry.Get(assignment.NodeID)
+		if !exists {
+			log.Printf("reconciler: node %s not found for workload %s", assignment.NodeID, workload.ID)
+			r.scheduler.Unassign(workload.ID)
+			continue
+		}
 
-			backoff := time.Duration(attempt) * 5 * time.Second
-			if backoff > 60*time.Second {
-				backoff = 60 * time.Second
-			}
+		if err := r.pushAssignment(node, workload); err != nil {
+			log.Printf("reconciler: push assignment %s to %s: %v", workload.ID, node.ID, err)
+		}
+	}
 
-			log.Printf("reconciler: %s is unhealthy, restarting in %s (attempt %d)", id, backoff, attempt)
-
-			go func(containerID string, delay time.Duration) {
-				time.Sleep(delay)
-				if err := r.client.KillContainer(containerID, true); err != nil {
-					log.Printf("reconciler: kill unhealthy %s: %v", containerID, err)
+	// Stop containers on nodes for workloads no longer in desired state.
+	for _, assignment := range r.scheduler.ListAssignments() {
+		if _, exists := desired[assignment.WorkloadID]; !exists {
+			node, ok := r.registry.Get(assignment.NodeID)
+			if ok {
+				if err := r.pushUnassign(node, assignment.WorkloadID); err != nil {
+					log.Printf("reconciler: unassign %s from %s: %v", assignment.WorkloadID, node.ID, err)
 				}
-			}(id, backoff)
+			}
+			r.scheduler.Unassign(assignment.WorkloadID)
 		}
 	}
 
-	// Stop containers that are running but no longer desired.
-	for id := range observed {
-		if _, ok := desired[id]; ok {
-			continue
-		}
-		if err := r.client.KillContainer(id, true); err != nil {
-			log.Printf("reconciler: kill %s: %v", id, err)
-		}
-		r.monitor.Unwatch(id)
-	}
+	return nil
 }
 
-func (r *Reconciler) start(w types.Workload) {
-	go func() {
-		image, err := r.client.GetImage(w.Image)
-		if err != nil {
-			image, err = r.client.PullImage(w.Image)
-			if err != nil {
-				log.Printf("reconciler: pull %s: %v", w.ID, err)
-				return
-			}
-		}
+// pushAssignment sends a workload assignment to an agent node.
+func (r *Reconciler) pushAssignment(node types.Node, w types.Workload) error {
+	body, err := json.Marshal(w)
+	if err != nil {
+		return fmt.Errorf("marshal workload: %w", err)
+	}
 
-		started := make(chan struct{})
-		abort := make(chan struct{})
+	url := fmt.Sprintf("http://%s/assign", node.Addr)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("post assign: %w", err)
+	}
+	defer resp.Body.Close()
 
-		go func() {
-			select {
-			case <-started:
-				r.ResetFailures(w.ID)
-				r.monitor.Watch(w)
-			case <-abort:
-				// Container failed to start — nothing to watch.
-			}
-		}()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("assign failed: status %d", resp.StatusCode)
+	}
 
-		code, err := r.client.RunContainer(runtime.RunOptions{
-			ID:      w.ID,
-			Image:   image,
-			Args:    w.Args,
-			Started: started,
-		})
-		if err != nil {
-			close(abort)
-			if runtime.ErrAlreadyExists(err) {
-				return
-			}
-			log.Printf("reconciler: run %s: %v", w.ID, err)
-			return
-		}
+	return nil
+}
 
-		r.monitor.Unwatch(w.ID)
-		log.Printf("reconciler: %s exited (code %d)", w.ID, code)
-	}()
+// pushUnassign tells an agent node to stop a container.
+func (r *Reconciler) pushUnassign(node types.Node, workloadID string) error {
+	url := fmt.Sprintf("http://%s/assign/%s", node.Addr, workloadID)
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete assign: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unassign failed: status %d", resp.StatusCode)
+	}
+
+	return nil
 }

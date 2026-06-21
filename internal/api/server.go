@@ -7,23 +7,29 @@ import (
 	"net/http"
 
 	"github.com/kkjorsvik/smith/internal/reconciler"
+	"github.com/kkjorsvik/smith/internal/registry"
 	"github.com/kkjorsvik/smith/internal/runtime"
+	"github.com/kkjorsvik/smith/internal/scheduler"
 	"github.com/kkjorsvik/smith/internal/types"
 )
 
 // Server exposes smith's desired and observed state over HTTP.
 type Server struct {
-	store  reconciler.Storer
-	client *runtime.Client
-	addr   string
+	store     reconciler.Storer
+	client    *runtime.Client
+	registry  *registry.Registry
+	scheduler *scheduler.Scheduler
+	addr      string
 }
 
 // New returns a Server bound to addr.
-func New(store reconciler.Storer, client *runtime.Client, addr string) *Server {
+func New(store reconciler.Storer, client *runtime.Client, reg *registry.Registry, sched *scheduler.Scheduler, addr string) *Server {
 	return &Server{
-		store:  store,
-		client: client,
-		addr:   addr,
+		store:     store,
+		client:    client,
+		registry:  reg,
+		scheduler: sched,
+		addr:      addr,
 	}
 }
 
@@ -34,6 +40,10 @@ func (s *Server) Start() {
 	mux.HandleFunc("POST /workloads", s.addWorkload)
 	mux.HandleFunc("DELETE /workloads/{id}", s.removeWorkload)
 	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("POST /nodes/register", s.registerNode)
+	mux.HandleFunc("POST /nodes/{id}/heartbeat", s.heartbeat)
+	mux.HandleFunc("GET /nodes", s.listNodes)
+	mux.HandleFunc("GET /assignments", s.listAssignments)
 
 	go func() {
 		log.Printf("api: listening on %s", s.addr)
@@ -104,6 +114,47 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, observed)
+}
+
+// registerNode handles agent registration requests.
+func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
+	var node types.Node
+	if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
+		httpError(w, fmt.Errorf("decode body: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	s.registry.Register(node)
+	log.Printf("api: node registered: %s at %s", node.ID, node.Addr)
+	w.WriteHeader(http.StatusOK)
+}
+
+// heartbeat handles agent heartbeat requests.
+func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		httpError(w, fmt.Errorf("missing id"), http.StatusBadRequest)
+		return
+	}
+
+	if err := s.registry.Heartbeat(id); err != nil {
+		httpError(w, err, http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// listNodes returns all registered nodes and their status.
+func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
+	nodes := s.registry.List()
+	writeJSON(w, http.StatusOK, nodes)
+}
+
+// listAssignments returns all current workload->node assignments.
+func (s *Server) listAssignments(w http.ResponseWriter, r *http.Request) {
+	assignments := s.scheduler.ListAssignments()
+	writeJSON(w, http.StatusOK, assignments)
 }
 
 // writeJSON encodes v as JSON and writes it to w with the given status code.

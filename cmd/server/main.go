@@ -10,7 +10,9 @@ import (
 	"github.com/kkjorsvik/smith/internal/api"
 	"github.com/kkjorsvik/smith/internal/health"
 	"github.com/kkjorsvik/smith/internal/reconciler"
+	"github.com/kkjorsvik/smith/internal/registry"
 	"github.com/kkjorsvik/smith/internal/runtime"
+	"github.com/kkjorsvik/smith/internal/scheduler"
 )
 
 func main() {
@@ -32,15 +34,14 @@ func main() {
 
 	monitor := health.NewMonitor(client)
 
-	r := reconciler.New(client, store, monitor, 5*time.Second)
+	reg := registry.New()
+	sched := scheduler.New(reg)
 
-	monitor.OnHealthy = func(id string) {
-		r.ResetFailures(id)
-	}
+	r := reconciler.New(client, store, monitor, reg, sched, 5*time.Second)
 
 	r.Start()
 
-	server := api.New(store, client, ":8080")
+	server := api.New(store, client, reg, sched, ":8080")
 	server.Start()
 
 	log.Println("smith running — press ctrl+c to stop")
