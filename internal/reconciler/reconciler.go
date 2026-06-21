@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
+	"github.com/containerd/containerd"
 	"github.com/kkjorsvik/smith/internal/health"
 	"github.com/kkjorsvik/smith/internal/registry"
 	"github.com/kkjorsvik/smith/internal/runtime"
@@ -35,6 +37,8 @@ type Reconciler struct {
 	scheduler *scheduler.Scheduler
 	interval  time.Duration
 	stop      chan struct{}
+	pushed    map[string]string // workloadID -> nodeID last successfully pushed to
+	mu        sync.Mutex
 }
 
 // New returns a Reconciler that reconciles every interval.
@@ -47,6 +51,7 @@ func New(client *runtime.Client, store Storer, monitor *health.Monitor, reg *reg
 		scheduler: sched,
 		interval:  interval,
 		stop:      make(chan struct{}),
+		pushed:    make(map[string]string),
 	}
 }
 
@@ -90,6 +95,11 @@ func (r *Reconciler) reconcile() error {
 		evicted := r.scheduler.ReassignNode(node.ID)
 		if len(evicted) > 0 {
 			log.Printf("reconciler: node %s is dead, evicting %d workloads", node.ID, len(evicted))
+			r.mu.Lock()
+			for _, wID := range evicted {
+				delete(r.pushed, wID)
+			}
+			r.mu.Unlock()
 		}
 		r.registry.Remove(node.ID)
 	}
@@ -109,8 +119,41 @@ func (r *Reconciler) reconcile() error {
 			continue
 		}
 
-		if err := r.pushAssignment(node, workload); err != nil {
-			log.Printf("reconciler: push assignment %s to %s: %v", workload.ID, node.ID, err)
+		r.mu.Lock()
+		alreadyPushed := r.pushed[workload.ID] == assignment.NodeID
+		r.mu.Unlock()
+
+		if !alreadyPushed {
+			if err := r.pushAssignment(node, workload); err != nil {
+				log.Printf("reconciler: push assignment %s to %s: %v", workload.ID, node.ID, err)
+				continue
+			}
+			r.mu.Lock()
+			r.pushed[workload.ID] = assignment.NodeID
+			r.mu.Unlock()
+			log.Printf("reconciler: pushed %s to %s", workload.ID, node.ID)
+		}
+	}
+
+	// Check that pushed workloads are actually running on their assigned nodes.
+	for workloadID, nodeID := range r.pushed {
+		node, exists := r.registry.Get(nodeID)
+		if !exists {
+			continue
+		}
+
+		agentStatus, err := r.fetchAgentStatus(node)
+		if err != nil {
+			log.Printf("reconciler: fetch status from %s: %v", node.ID, err)
+			continue
+		}
+
+		status, running := agentStatus[workloadID]
+		if !running || status.Status != containerd.Running {
+			log.Printf("reconciler: %s not running on %s, will repush", workloadID, nodeID)
+			r.mu.Lock()
+			delete(r.pushed, workloadID)
+			r.mu.Unlock()
 		}
 	}
 
@@ -124,6 +167,9 @@ func (r *Reconciler) reconcile() error {
 				}
 			}
 			r.scheduler.Unassign(assignment.WorkloadID)
+			r.mu.Lock()
+			delete(r.pushed, assignment.WorkloadID)
+			r.mu.Unlock()
 		}
 	}
 
@@ -170,4 +216,22 @@ func (r *Reconciler) pushUnassign(node types.Node, workloadID string) error {
 	}
 
 	return nil
+}
+
+// fetchAgentStatus queries an agent's /status endpoint and returns
+// a map of container ID -> ContainerStatus.
+func (r *Reconciler) fetchAgentStatus(node types.Node) (map[string]runtime.ContainerStatus, error) {
+	url := fmt.Sprintf("http://%s/status", node.Addr)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("get status from %s: %w", node.ID, err)
+	}
+	defer resp.Body.Close()
+
+	var status map[string]runtime.ContainerStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, fmt.Errorf("decode status from %s: %w", node.ID, err)
+	}
+
+	return status, nil
 }

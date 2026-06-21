@@ -206,9 +206,9 @@ func ErrAlreadyExists(err error) bool {
 
 // ContainerStatus represents the observed state of a single container.
 type ContainerStatus struct {
-	ID     string
-	Status containerd.ProcessStatus
-	Pid    uint32
+	ID     string                   `json:"id"`
+	Status containerd.ProcessStatus `json:"status"`
+	Pid    uint32                   `json:"pid"`
 }
 
 // ListRunning returns all containers in the smith namespace and their
