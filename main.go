@@ -33,6 +33,11 @@ func main() {
 	monitor := health.NewMonitor(client)
 
 	r := reconciler.New(client, store, monitor, 5*time.Second)
+
+	monitor.OnHealthy = func(id string) {
+		r.ResetFailures(id)
+	}
+
 	r.Start()
 
 	server := api.New(store, client, ":8080")

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd"
 	"github.com/kkjorsvik/smith/internal/health"
 	"github.com/kkjorsvik/smith/internal/runtime"
 	"github.com/kkjorsvik/smith/internal/types"
@@ -20,18 +21,16 @@ type Storer interface {
 
 // Reconciler periodically compares the desired state (from the store)
 // against the observed state (from containerd) and takes action to
-// converge them: starting missing containers and stopping extra ones.
+// converge them: starting missing containers, stopping extra ones, and
+// restarting unhealthy ones with exponential backoff.
 type Reconciler struct {
 	client   *runtime.Client
 	store    Storer
 	monitor  *health.Monitor
 	interval time.Duration
-
-	mu      sync.Mutex
-	running map[string]bool
-
-	stop chan struct{}
-	done chan struct{}
+	stop     chan struct{}
+	failures map[string]int
+	mu       sync.Mutex
 }
 
 // New returns a Reconciler that reconciles every interval.
@@ -41,9 +40,8 @@ func New(client *runtime.Client, store Storer, monitor *health.Monitor, interval
 		store:    store,
 		monitor:  monitor,
 		interval: interval,
-		running:  make(map[string]bool),
 		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		failures: make(map[string]int),
 	}
 }
 
@@ -52,26 +50,21 @@ func (r *Reconciler) Start() {
 	go r.loop()
 }
 
-// Stop halts the reconcile loop and tears down every running container.
-func (r *Reconciler) Stop() {
-	close(r.stop)
-	<-r.done
-
+// ResetFailures resets the restart counter for a workload.
+// Called by the health monitor when a container recovers.
+func (r *Reconciler) ResetFailures(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	delete(r.failures, id)
+}
 
-	for id := range r.running {
-		if err := r.client.KillContainer(id, true); err != nil {
-			log.Printf("reconciler: stop %s: %v", id, err)
-		}
-		r.monitor.Unwatch(id)
-		delete(r.running, id)
-	}
+// Stop halts the reconcile loop. Containers left running are cleaned up by
+// CleanupAll on the next startup.
+func (r *Reconciler) Stop() {
+	close(r.stop)
 }
 
 func (r *Reconciler) loop() {
-	defer close(r.done)
-
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 
@@ -94,19 +87,47 @@ func (r *Reconciler) reconcile() {
 		return
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Start workloads that are desired but not yet running.
-	for id, w := range desired {
-		if r.running[id] {
-			continue
-		}
-		r.launch(w)
+	observed, err := r.client.ListRunning()
+	if err != nil {
+		log.Printf("reconciler: list running: %v", err)
+		return
 	}
 
-	// Stop workloads that are running but no longer desired.
-	for id := range r.running {
+	for id, w := range desired {
+		obs, running := observed[id]
+
+		// Not running yet — (re)start it. start() arms the health monitor
+		// once the task is confirmed running.
+		if !running || obs.Status != containerd.Running {
+			log.Printf("reconciler: starting %s", id)
+			r.start(w)
+			continue
+		}
+
+		if obs.Status == containerd.Running && !r.monitor.Healthy(id) {
+			r.mu.Lock()
+			r.failures[id]++
+			attempt := r.failures[id]
+			r.mu.Unlock()
+
+			backoff := time.Duration(attempt) * 5 * time.Second
+			if backoff > 60*time.Second {
+				backoff = 60 * time.Second
+			}
+
+			log.Printf("reconciler: %s is unhealthy, restarting in %s (attempt %d)", id, backoff, attempt)
+
+			go func(containerID string, delay time.Duration) {
+				time.Sleep(delay)
+				if err := r.client.KillContainer(containerID, true); err != nil {
+					log.Printf("reconciler: kill unhealthy %s: %v", containerID, err)
+				}
+			}(id, backoff)
+		}
+	}
+
+	// Stop containers that are running but no longer desired.
+	for id := range observed {
 		if _, ok := desired[id]; ok {
 			continue
 		}
@@ -114,36 +135,49 @@ func (r *Reconciler) reconcile() {
 			log.Printf("reconciler: kill %s: %v", id, err)
 		}
 		r.monitor.Unwatch(id)
-		delete(r.running, id)
 	}
 }
 
-// launch pulls the image and starts the container in a background
-// goroutine. Must be called with r.mu held.
-func (r *Reconciler) launch(w types.Workload) {
-	image, err := r.client.PullImage(w.Image)
-	if err != nil {
-		log.Printf("reconciler: pull image for %s: %v", w.ID, err)
-		return
-	}
-
-	r.running[w.ID] = true
-	r.monitor.Watch(w)
-
+func (r *Reconciler) start(w types.Workload) {
 	go func() {
-		_, err := r.client.RunContainer(runtime.RunOptions{
-			ID:    w.ID,
-			Image: image,
-			Args:  w.Args,
-		})
-		if err != nil && !runtime.ErrAlreadyExists(err) {
-			log.Printf("reconciler: run %s exited: %v", w.ID, err)
+		image, err := r.client.GetImage(w.Image)
+		if err != nil {
+			image, err = r.client.PullImage(w.Image)
+			if err != nil {
+				log.Printf("reconciler: pull %s: %v", w.ID, err)
+				return
+			}
 		}
 
-		// The container has exited; drop it from the running set so the
-		// next reconcile tick can restart it if it is still desired.
-		r.mu.Lock()
-		delete(r.running, w.ID)
-		r.mu.Unlock()
+		started := make(chan struct{})
+		abort := make(chan struct{})
+
+		go func() {
+			select {
+			case <-started:
+				r.ResetFailures(w.ID)
+				r.monitor.Watch(w)
+			case <-abort:
+				// Container failed to start — nothing to watch.
+			}
+		}()
+
+		code, err := r.client.RunContainer(runtime.RunOptions{
+			ID:      w.ID,
+			Image:   image,
+			Args:    w.Args,
+			Started: started,
+		})
+		if err != nil {
+			close(abort)
+			if runtime.ErrAlreadyExists(err) {
+				return
+			}
+			log.Printf("reconciler: run %s: %v", w.ID, err)
+			return
+		}
+
+		r.monitor.Unwatch(w.ID)
+		log.Printf("reconciler: %s exited (code %d)", w.ID, code)
 	}()
 }

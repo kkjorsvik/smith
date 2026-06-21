@@ -67,6 +67,16 @@ func (c *Client) PullImage(ref string) (containerd.Image, error) {
 	return image, nil
 }
 
+// GetImage returns a local image if it exists, without hitting the registry.
+func (c *Client) GetImage(ref string) (containerd.Image, error) {
+	ctx := c.Context()
+	image, err := c.inner.GetImage(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("get image %s: %w", ref, err)
+	}
+	return image, nil
+}
+
 // RunOptions configures how a container is run.
 type RunOptions struct {
 	// ID is the unique container identifier within the smith namespace.
@@ -312,6 +322,7 @@ func (c *Client) ExecInContainer(ctx context.Context, id string, command []strin
 	spec := &specs.Process{
 		Args: command,
 		Cwd:  "/",
+		Env:  []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 	}
 
 	process, err := task.Exec(ctx, execID, spec, cio.NullIO)

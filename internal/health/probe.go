@@ -22,10 +22,11 @@ type Status struct {
 // It maintains a map of container ID -> Status that the reconciler
 // consults on each tick.
 type Monitor struct {
-	client  *runtime.Client
-	mu      sync.RWMutex
-	status  map[string]*Status
-	cancels map[string]context.CancelFunc
+	client    *runtime.Client
+	mu        sync.RWMutex
+	status    map[string]*Status
+	cancels   map[string]context.CancelFunc
+	OnHealthy func(id string)
 }
 
 // NewMonitor returns a Monitor ready to use.
@@ -116,8 +117,16 @@ func (m *Monitor) run(ctx context.Context, w types.Workload) {
 				if s.Failures >= hc.Threshold {
 					s.Healthy = false
 					log.Printf("health: %s is unhealthy", w.ID)
+					m.mu.Unlock()
+					return
 				}
 			} else {
+				if s.Failures > 0 {
+					log.Printf("health: %s recovered", w.ID)
+					if m.OnHealthy != nil {
+						m.OnHealthy(w.ID)
+					}
+				}
 				s.Failures = 0
 				s.Healthy = true
 			}

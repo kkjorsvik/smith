@@ -31,16 +31,75 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	return store, nil
 }
 
+// migrate brings the schema up to date. It is idempotent and safe to run
+// on every startup, against both a fresh database and one created by an
+// older version of smith.
 func (s *SQLiteStore) migrate() error {
-	_, err := s.db.Exec(`
+	// Base table for fresh installs. CREATE TABLE IF NOT EXISTS never
+	// alters an existing table, so column additions are handled below.
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS workloads (
 			id    TEXT PRIMARY KEY,
 			image TEXT NOT NULL,
 			args  TEXT NOT NULL,
 			health_check TEXT
 		);
-	`)
-	return err
+	`); err != nil {
+		return fmt.Errorf("create workloads table: %w", err)
+	}
+
+	// Incremental column migrations for databases created before a column
+	// existed. Each entry is applied only if the column is missing, so this
+	// stays idempotent and avoids "duplicate column name" errors.
+	columns := []struct {
+		name string
+		ddl  string
+	}{
+		{"health_check", "ALTER TABLE workloads ADD COLUMN health_check TEXT"},
+	}
+
+	for _, c := range columns {
+		exists, err := s.columnExists("workloads", c.name)
+		if err != nil {
+			return fmt.Errorf("check column %s: %w", c.name, err)
+		}
+		if exists {
+			continue
+		}
+		if _, err := s.db.Exec(c.ddl); err != nil {
+			return fmt.Errorf("add column %s: %w", c.name, err)
+		}
+	}
+
+	return nil
+}
+
+// columnExists reports whether table has a column with the given name.
+func (s *SQLiteStore) columnExists(table, column string) (bool, error) {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("table_info(%s): %w", table, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			ctype      string
+			notNull    int
+			dfltValue  sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &primaryKey); err != nil {
+			return false, fmt.Errorf("scan table_info: %w", err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+
+	return false, rows.Err()
 }
 
 func (s *SQLiteStore) Add(w types.Workload) error {
@@ -88,7 +147,9 @@ func (s *SQLiteStore) Remove(id string) error {
 }
 
 func (s *SQLiteStore) List() (map[string]types.Workload, error) {
-	rows, err := s.db.Query(`SELECT id, image, args, health_check FROM workloads`)
+	// COALESCE guards against NULL health_check values, which exist on rows
+	// created before the column was added by an ALTER TABLE migration.
+	rows, err := s.db.Query(`SELECT id, image, args, COALESCE(health_check, '') FROM workloads`)
 	if err != nil {
 		return nil, fmt.Errorf("query workloads: %w", err)
 	}
