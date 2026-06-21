@@ -3,9 +3,13 @@ module github.com/kkjorsvik/smith
 go 1.26.4
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.42.0
+	github.com/aws/aws-sdk-go-v2/config v1.32.25
+	github.com/aws/aws-sdk-go-v2/service/route53 v1.63.3
 	github.com/containerd/containerd v1.7.33
 	github.com/mattn/go-sqlite3 v1.14.46
 	github.com/opencontainers/runtime-spec v1.1.0
+	golang.org/x/crypto v0.53.0
 )
 
 require (
@@ -13,6 +17,18 @@ require (
 	github.com/AdamKorcz/go-118-fuzz-build v0.0.0-20230306123547-8075edf89bb0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/Microsoft/hcsshim v0.11.7 // indirect
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.24 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.29 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.29 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.29 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.30 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.12 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.29 // indirect
+	github.com/aws/aws-sdk-go-v2/service/signin v1.2.0 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.31.3 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.36.6 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3 // indirect
+	github.com/aws/smithy-go v1.27.1 // indirect
 	github.com/containerd/cgroups v1.1.0 // indirect
 	github.com/containerd/containerd/api v1.8.0 // indirect
 	github.com/containerd/continuity v0.4.4 // indirect
@@ -50,10 +66,10 @@ require (
 	go.opentelemetry.io/otel v1.21.0 // indirect
 	go.opentelemetry.io/otel/metric v1.21.0 // indirect
 	go.opentelemetry.io/otel/trace v1.21.0 // indirect
-	golang.org/x/net v0.47.0 // indirect
-	golang.org/x/sync v0.18.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/text v0.31.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sync v0.21.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	google.golang.org/genproto v0.0.0-20231211222908-989df2bf70f3 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240401170217-c3f982113cda // indirect
 	google.golang.org/grpc v1.59.0 // indirect

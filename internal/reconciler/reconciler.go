@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -35,23 +36,38 @@ type Reconciler struct {
 	monitor   *health.Monitor
 	registry  *registry.Registry
 	scheduler *scheduler.Scheduler
-	interval  time.Duration
-	stop      chan struct{}
-	pushed    map[string]string // workloadID -> nodeID last successfully pushed to
-	mu        sync.Mutex
+	interval   time.Duration
+	stop       chan struct{}
+	pushed     map[string]pushRecord // workloadID -> last successful push
+	mu         sync.Mutex
+	httpClient *http.Client
 }
 
-// New returns a Reconciler that reconciles every interval.
-func New(client *runtime.Client, store Storer, monitor *health.Monitor, reg *registry.Registry, sched *scheduler.Scheduler, interval time.Duration) *Reconciler {
+// pushRecord tracks where and when a workload was last successfully pushed.
+type pushRecord struct {
+	nodeID   string
+	pushedAt time.Time
+}
+
+// New returns a Reconciler that reconciles every interval. tlsCfg is used
+// for mTLS calls to agents (assign/unassign/status).
+func New(client *runtime.Client, store Storer, monitor *health.Monitor, reg *registry.Registry, sched *scheduler.Scheduler, tlsCfg *tls.Config, interval time.Duration) *Reconciler {
+	httpClient := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: tlsCfg,
+		},
+	}
 	return &Reconciler{
-		client:    client,
-		store:     store,
-		monitor:   monitor,
-		registry:  reg,
-		scheduler: sched,
-		interval:  interval,
-		stop:      make(chan struct{}),
-		pushed:    make(map[string]string),
+		client:     client,
+		store:      store,
+		monitor:    monitor,
+		registry:   reg,
+		scheduler:  sched,
+		interval:   interval,
+		stop:       make(chan struct{}),
+		pushed:     make(map[string]pushRecord),
+		httpClient: httpClient,
 	}
 }
 
@@ -120,7 +136,8 @@ func (r *Reconciler) reconcile() error {
 		}
 
 		r.mu.Lock()
-		alreadyPushed := r.pushed[workload.ID] == assignment.NodeID
+		rec, exists := r.pushed[workload.ID]
+		alreadyPushed := exists && rec.nodeID == assignment.NodeID
 		r.mu.Unlock()
 
 		if !alreadyPushed {
@@ -129,15 +146,21 @@ func (r *Reconciler) reconcile() error {
 				continue
 			}
 			r.mu.Lock()
-			r.pushed[workload.ID] = assignment.NodeID
+			r.pushed[workload.ID] = pushRecord{nodeID: assignment.NodeID, pushedAt: time.Now()}
 			r.mu.Unlock()
 			log.Printf("reconciler: pushed %s to %s", workload.ID, node.ID)
 		}
 	}
 
 	// Check that pushed workloads are actually running on their assigned nodes.
-	for workloadID, nodeID := range r.pushed {
-		node, exists := r.registry.Get(nodeID)
+	gracePeriod := 2 * r.interval
+	for workloadID, rec := range r.pushed {
+		// Give the container time to start before checking.
+		if time.Since(rec.pushedAt) < gracePeriod {
+			continue
+		}
+
+		node, exists := r.registry.Get(rec.nodeID)
 		if !exists {
 			continue
 		}
@@ -150,7 +173,7 @@ func (r *Reconciler) reconcile() error {
 
 		status, running := agentStatus[workloadID]
 		if !running || status.Status != containerd.Running {
-			log.Printf("reconciler: %s not running on %s, will repush", workloadID, nodeID)
+			log.Printf("reconciler: %s not running on %s, will repush", workloadID, rec.nodeID)
 			r.mu.Lock()
 			delete(r.pushed, workloadID)
 			r.mu.Unlock()
@@ -183,8 +206,8 @@ func (r *Reconciler) pushAssignment(node types.Node, w types.Workload) error {
 		return fmt.Errorf("marshal workload: %w", err)
 	}
 
-	url := fmt.Sprintf("http://%s/assign", node.Addr)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	url := fmt.Sprintf("https://%s/assign", node.Addr)
+	resp, err := r.httpClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("post assign: %w", err)
 	}
@@ -199,13 +222,13 @@ func (r *Reconciler) pushAssignment(node types.Node, w types.Workload) error {
 
 // pushUnassign tells an agent node to stop a container.
 func (r *Reconciler) pushUnassign(node types.Node, workloadID string) error {
-	url := fmt.Sprintf("http://%s/assign/%s", node.Addr, workloadID)
+	url := fmt.Sprintf("https://%s/assign/%s", node.Addr, workloadID)
 	req, err := http.NewRequest(http.MethodDelete, url, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("delete assign: %w", err)
 	}
@@ -221,8 +244,8 @@ func (r *Reconciler) pushUnassign(node types.Node, workloadID string) error {
 // fetchAgentStatus queries an agent's /status endpoint and returns
 // a map of container ID -> ContainerStatus.
 func (r *Reconciler) fetchAgentStatus(node types.Node) (map[string]runtime.ContainerStatus, error) {
-	url := fmt.Sprintf("http://%s/status", node.Addr)
-	resp, err := http.Get(url)
+	url := fmt.Sprintf("https://%s/status", node.Addr)
+	resp, err := r.httpClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("get status from %s: %w", node.ID, err)
 	}
@@ -234,4 +257,22 @@ func (r *Reconciler) fetchAgentStatus(node types.Node) (map[string]runtime.Conta
 	}
 
 	return status, nil
+}
+
+// AggregateStatus fans out to every alive node's /status endpoint and
+// returns a map of nodeID -> (containerID -> ContainerStatus).
+func (r *Reconciler) AggregateStatus() map[string]map[string]runtime.ContainerStatus {
+	out := make(map[string]map[string]runtime.ContainerStatus)
+
+	for _, node := range r.registry.Alive() {
+		status, err := r.fetchAgentStatus(node)
+		if err != nil {
+			log.Printf("reconciler: aggregate status from %s: %v", node.ID, err)
+			out[node.ID] = map[string]runtime.ContainerStatus{}
+			continue
+		}
+		out[node.ID] = status
+	}
+
+	return out
 }
