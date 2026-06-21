@@ -196,6 +196,7 @@ func (a *Agent) handleAssign(w http.ResponseWriter, r *http.Request) {
 			Image: image,
 			Args:  wl.Args,
 			Ports: wl.Ports,
+			Env:   wl.Env,
 			CNI:   a.cni,
 		})
 		if err != nil {

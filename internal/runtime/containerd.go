@@ -98,6 +98,9 @@ type RunOptions struct {
 	// (bridge IP + port mappings). When nil, networking is left as
 	// containerd's default and Ports is ignored.
 	CNI *CNI
+	// Env are environment variables (KEY=VALUE) injected into the
+	// container, merged over the image's defaults.
+	Env map[string]string
 }
 
 // RunContainer creates a container, starts it, waits for it to exit,
@@ -114,6 +117,13 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	}
 	if len(opts.Args) > 0 {
 		specOpts = append(specOpts, oci.WithProcessArgs(opts.Args...))
+	}
+	if len(opts.Env) > 0 {
+		envSlice := make([]string, 0, len(opts.Env))
+		for k, v := range opts.Env {
+			envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
+		}
+		specOpts = append(specOpts, oci.WithEnv(envSlice))
 	}
 
 	// NewContainer creates the metadata record and a fresh writable
