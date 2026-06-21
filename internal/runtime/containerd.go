@@ -140,13 +140,17 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 		}
 		return 0, fmt.Errorf("create container %s: %w", opts.ID, err)
 	}
-	// StopContainer may delete this container out from under us when the
-	// workload is unassigned. Tolerate the already-gone case so the
-	// deferred cleanup doesn't log a spurious error on the normal path.
+	// Track whether the container started successfully. On any early
+	// error return, clean up the container and snapshot. StopContainer
+	// may also delete this container out from under us when the workload
+	// is unassigned, so the not-found case is tolerated.
+	started := false
 	defer func() {
-		if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
-			if !errdefs.IsNotFound(err) {
-				log.Printf("warn: container delete %s: %v", opts.ID, err)
+		if !started {
+			if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
+				if !errdefs.IsNotFound(err) {
+					log.Printf("warn: container cleanup %s: %v", opts.ID, err)
+				}
 			}
 		}
 	}()
@@ -158,6 +162,21 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 		return 0, fmt.Errorf("create task for %s: %w", opts.ID, err)
 	}
 
+	// Clean up the task on any early error return. This defer is registered
+	// after the container-cleanup defer, so it runs FIRST (LIFO): the task
+	// is killed and deleted before the container delete, avoiding the
+	// "cannot delete running task" precondition error that leaves a ghost.
+	taskCleanup := true
+	defer func() {
+		if taskCleanup {
+			if _, err := task.Delete(ctx, containerd.WithProcessKill); err != nil {
+				if !errdefs.IsNotFound(err) {
+					log.Printf("warn: task cleanup %s: %v", opts.ID, err)
+				}
+			}
+		}
+	}()
+
 	// Set up CNI networking if configured. The task already has its own
 	// network namespace at /proc/<pid>/ns/net; CNI populates it with a
 	// bridge IP and any host port mappings before the process starts.
@@ -165,19 +184,38 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	if opts.CNI != nil {
 		netnsPath = fmt.Sprintf("/proc/%d/ns/net", task.Pid())
 		if _, err := opts.CNI.Setup(ctx, opts.ID, netnsPath, opts.Ports); err != nil {
-			task.Delete(ctx)
+			log.Printf("RunContainer %s FAILED at cni-setup: %v", opts.ID, err)
 			return 0, fmt.Errorf("cni setup for %s: %w", opts.ID, err)
 		}
+		log.Printf("RunContainer %s: CNI setup OK, netns=%s", opts.ID, netnsPath)
 	}
+
+	// Tear down CNI on any early error return after setup succeeded. Runs
+	// before the task-cleanup defer (LIFO), matching the correct teardown
+	// order: CNI first, then task, then container.
+	cniDone := false
+	defer func() {
+		if !cniDone && opts.CNI != nil && netnsPath != "" {
+			log.Printf("RunContainer %s: cleanup CNI teardown attempt netns=%s", opts.ID, netnsPath)
+			if err := opts.CNI.Teardown(ctx, opts.ID, netnsPath, opts.Ports); err != nil {
+				log.Printf("RunContainer %s: cleanup CNI teardown FAILED: %v", opts.ID, err)
+			} else {
+				log.Printf("RunContainer %s: cleanup CNI teardown SUCCESS", opts.ID)
+			}
+		}
+	}()
 
 	// Call Wait BEFORE Start — if the process exits fast you can miss
 	// the exit event if Wait is called after Start.
 	exitCh, err := task.Wait(ctx)
 	if err != nil {
+		log.Printf("RunContainer %s FAILED at task-wait: %v", opts.ID, err)
 		return 0, fmt.Errorf("wait setup for %s: %w", opts.ID, err)
 	}
 
+	log.Printf("RunContainer %s: starting task", opts.ID)
 	if err := task.Start(ctx); err != nil {
+		log.Printf("RunContainer %s FAILED at task-start: %v", opts.ID, err)
 		return 0, fmt.Errorf("start task %s: %w", opts.ID, err)
 	}
 
@@ -186,21 +224,38 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	}
 	log.Printf("task started: %s (pid %d)", opts.ID, task.Pid())
 
+	// From here the container is successfully running. Disable the
+	// early-return container cleanup defer; teardown is handled explicitly
+	// below in the correct order once the process exits.
+	started = true
+
 	// Block until the container process exits.
 	status := <-exitCh
 
-	// Tear down CNI networking with the same ports used in Setup so the
-	// portmap plugin removes the matching DNAT rules.
+	// Explicit teardown on normal exit, in the correct order: CNI, then
+	// task, then container. Each flag is cleared so the matching defer does
+	// not double-delete. not-found is tolerated because StopContainer may
+	// have torn part of this down concurrently on an unassign.
 	if opts.CNI != nil && netnsPath != "" {
 		if err := opts.CNI.Teardown(ctx, opts.ID, netnsPath, opts.Ports); err != nil {
 			log.Printf("warn: cni teardown %s: %v", opts.ID, err)
 		}
 	}
+	cniDone = true
 
 	// Delete the task AFTER receiving exit status — deferring this
 	// races with exit status collection and can swallow signal codes.
 	if _, err := task.Delete(ctx); err != nil {
-		log.Printf("warn: task delete %s: %v", opts.ID, err)
+		if !errdefs.IsNotFound(err) {
+			log.Printf("warn: task delete %s: %v", opts.ID, err)
+		}
+	}
+	taskCleanup = false
+
+	if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
+		if !errdefs.IsNotFound(err) {
+			log.Printf("warn: container delete %s: %v", opts.ID, err)
+		}
 	}
 
 	code, _, err := status.Result()
