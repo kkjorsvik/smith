@@ -30,6 +30,7 @@ type Agent struct {
 	stop       chan struct{}
 	httpClient *http.Client
 	serverTLS  *tls.Config
+	cni        *smithruntime.CNI
 }
 
 // New returns an Agent.
@@ -45,6 +46,16 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 			TLSClientConfig: clientTLS,
 		},
 	}
+
+	// CNI is best-effort: if it can't initialize (no config in
+	// /etc/cni/net.d, missing plugins), the agent still runs and serves
+	// workloads without port mappings.
+	cni, err := smithruntime.NewCNI()
+	if err != nil {
+		log.Printf("agent: CNI init failed, port mapping disabled: %v", err)
+		cni = nil
+	}
+
 	return &Agent{
 		id:         id,
 		addr:       addr,
@@ -53,6 +64,7 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 		stop:       make(chan struct{}),
 		httpClient: httpClient,
 		serverTLS:  serverTLS,
+		cni:        cni,
 	}
 }
 
@@ -183,6 +195,8 @@ func (a *Agent) handleAssign(w http.ResponseWriter, r *http.Request) {
 			ID:    wl.ID,
 			Image: image,
 			Args:  wl.Args,
+			Ports: wl.Ports,
+			CNI:   a.cni,
 		})
 		if err != nil {
 			if smithruntime.ErrAlreadyExists(err) {

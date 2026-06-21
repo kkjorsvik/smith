@@ -7,6 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.25
 	github.com/aws/aws-sdk-go-v2/service/route53 v1.63.3
 	github.com/containerd/containerd v1.7.33
+	github.com/containerd/go-cni v1.1.10
 	github.com/mattn/go-sqlite3 v1.14.46
 	github.com/opencontainers/runtime-spec v1.1.0
 	golang.org/x/crypto v0.53.0
@@ -38,6 +39,7 @@ require (
 	github.com/containerd/platforms v0.2.1 // indirect
 	github.com/containerd/ttrpc v1.2.7 // indirect
 	github.com/containerd/typeurl/v2 v2.1.1 // indirect
+	github.com/containernetworking/cni v1.2.2 // indirect
 	github.com/cyphar/filepath-securejoin v0.5.1 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/go-events v0.0.0-20190806004212-e31b211e4f1c // indirect

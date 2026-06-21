@@ -14,6 +14,7 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/remotes/docker"
+	"github.com/kkjorsvik/smith/internal/types"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -90,6 +91,13 @@ type RunOptions struct {
 	// Optional — callers that need to know when the task is live
 	// should pass a make(chan struct{}) and block on it.
 	Started chan struct{}
+	// Ports are host->container port mappings to publish via CNI's
+	// portmap plugin. Only applied when CNI is non-nil.
+	Ports []types.PortMapping
+	// CNI, when non-nil, configures the container's network namespace
+	// (bridge IP + port mappings). When nil, networking is left as
+	// containerd's default and Ports is ignored.
+	CNI *CNI
 }
 
 // RunContainer creates a container, starts it, waits for it to exit,
@@ -131,6 +139,18 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 		return 0, fmt.Errorf("create task for %s: %w", opts.ID, err)
 	}
 
+	// Set up CNI networking if configured. The task already has its own
+	// network namespace at /proc/<pid>/ns/net; CNI populates it with a
+	// bridge IP and any host port mappings before the process starts.
+	var netnsPath string
+	if opts.CNI != nil {
+		netnsPath = fmt.Sprintf("/proc/%d/ns/net", task.Pid())
+		if _, err := opts.CNI.Setup(ctx, opts.ID, netnsPath, opts.Ports); err != nil {
+			task.Delete(ctx)
+			return 0, fmt.Errorf("cni setup for %s: %w", opts.ID, err)
+		}
+	}
+
 	// Call Wait BEFORE Start — if the process exits fast you can miss
 	// the exit event if Wait is called after Start.
 	exitCh, err := task.Wait(ctx)
@@ -149,6 +169,14 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 
 	// Block until the container process exits.
 	status := <-exitCh
+
+	// Tear down CNI networking with the same ports used in Setup so the
+	// portmap plugin removes the matching DNAT rules.
+	if opts.CNI != nil && netnsPath != "" {
+		if err := opts.CNI.Teardown(ctx, opts.ID, netnsPath, opts.Ports); err != nil {
+			log.Printf("warn: cni teardown %s: %v", opts.ID, err)
+		}
+	}
 
 	// Delete the task AFTER receiving exit status — deferring this
 	// races with exit status collection and can swallow signal codes.
