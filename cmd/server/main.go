@@ -80,6 +80,11 @@ func runServer() {
 
 	server := api.New(store, client, reg, sched, ":9443", serverTLS)
 	server.SetStatusFunc(r.AggregateStatus)
+
+	if err := server.LoadToken("/etc/smith/token"); err != nil {
+		log.Fatalf("load API token: %v", err)
+	}
+
 	server.Start()
 
 	log.Println("smith running — press ctrl+c to stop")

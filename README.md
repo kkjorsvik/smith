@@ -48,6 +48,8 @@ certificate obtained via the ACME **DNS-01** challenge (Route 53).
   returns real per-container state (status + PID) keyed by node.
 - **End-to-end TLS** — mutual TLS on the internal plane (private CA); public
   HTTPS via Let's Encrypt DNS-01.
+- **Authenticated public API** — the public `:443` endpoints require a bearer
+  token; the internal `:9443` plane is authenticated by agent client certs.
 - **Health checks** — workloads may declare `http` or `exec` probes (see
   [caveats](#operational-notes--caveats) for current wiring status).
 
@@ -79,6 +81,8 @@ Two trust boundaries:
   a publicly-trusted **Let's Encrypt** certificate obtained via the ACME
   **DNS-01** challenge using Route 53. DNS-01 is used because the server is
   typically behind NAT where port 80 is unreachable, so HTTP-01 cannot be used.
+  Callers authenticate with a **bearer token** (`Authorization: Bearer <token>`)
+  loaded from `/etc/smith/token`.
 - **Control plane ↔ agents** — every internal connection (the control plane's
   internal API on `:9443`, and each agent's API on its `-addr`) runs over
   **mutual TLS** using a private, self-signed Smith CA. Both ends present and
@@ -192,6 +196,7 @@ on the server). Plan your deployment around them, or change them in source:
 | Value | Where | Notes |
 |-------|-------|-------|
 | `/etc/smith/certs/{ca,server}.{crt,key}` | server startup | Internal mTLS material (read on boot) |
+| `/etc/smith/token` | server startup | Public API bearer token (read on boot; server refuses to start if missing/empty) |
 | `/var/lib/smith/state.db` | server | SQLite desired-state store |
 | `/var/lib/smith/autocert/server.{crt,key}` | server | Cached public Let's Encrypt cert |
 | `smith-server-01.kkjorsvik.com` | server cert + public ACME domain | The public hostname; also the server cert CN |
@@ -213,9 +218,25 @@ On startup it:
 1. Connects to the local containerd and cleans up the `smith` namespace.
 2. Opens the SQLite store at `/var/lib/smith/state.db`.
 3. Loads internal mTLS material from `/etc/smith/certs/`.
-4. Starts the reconcile loop (every 5s).
-5. Serves the internal mTLS API on `:9443` and provisions/serves the public
+4. Loads the public API bearer token from `/etc/smith/token` — **the server
+   refuses to start if it is missing or empty.**
+5. Starts the reconcile loop (every 5s).
+6. Serves the internal mTLS API on `:9443` and provisions/serves the public
    HTTPS API on `:443`.
+
+**Create the API token first.** The public `:443` endpoints require a bearer
+token (the internal `:9443` plane is protected by mTLS instead and needs no
+token). Generate one and write it to `/etc/smith/token` before starting:
+
+```bash
+# Generate a random token and write it to the token file
+openssl rand -hex 32 | sudo tee /etc/smith/token
+sudo chmod 600 /etc/smith/token
+```
+
+The token is the entire file contents trimmed of surrounding whitespace (the
+trailing newline from `tee` is ignored). To rotate it, replace the file and
+restart the server.
 
 **Public certificate (`:443`) prerequisites.** The DNS-01 flow needs AWS
 credentials resolvable via the default chain, with permission to:
@@ -309,6 +330,16 @@ Durations are human-readable strings (`"5s"`, `"1m30s"`), not nanoseconds.
 
 ### Public API — `:443` (HTTPS)
 
+**All public endpoints require bearer token authentication.** Send the token
+from `/etc/smith/token` on every request:
+
+```
+Authorization: Bearer <token>
+```
+
+Requests with a missing/malformed header or a non-matching token get
+`401 Unauthorized`. (The token is compared in constant time.)
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/workloads` | List desired workloads |
@@ -335,10 +366,11 @@ Durations are human-readable strings (`"5s"`, `"1m30s"`), not nanoseconds.
 
 ### Examples
 
-Add a workload:
+Add a workload (note the bearer token):
 
 ```bash
 curl https://smith-server-01.kkjorsvik.com/workloads \
+  -H "Authorization: Bearer $(sudo cat /etc/smith/token)" \
   -H 'Content-Type: application/json' \
   -d '{"id":"web","image":"docker.io/library/nginx:latest","args":[]}'
 ```
