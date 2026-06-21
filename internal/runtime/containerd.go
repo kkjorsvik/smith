@@ -140,7 +140,16 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 		}
 		return 0, fmt.Errorf("create container %s: %w", opts.ID, err)
 	}
-	defer container.Delete(ctx, containerd.WithSnapshotCleanup)
+	// StopContainer may delete this container out from under us when the
+	// workload is unassigned. Tolerate the already-gone case so the
+	// deferred cleanup doesn't log a spurious error on the normal path.
+	defer func() {
+		if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
+			if !errdefs.IsNotFound(err) {
+				log.Printf("warn: container delete %s: %v", opts.ID, err)
+			}
+		}
+	}()
 
 	// NewTask creates the actual OS process from the container spec.
 	// cio.WithStdio wires the container's stdin/stdout/stderr to ours.
@@ -229,6 +238,59 @@ func (c *Client) KillContainer(id string, force bool) error {
 		return fmt.Errorf("kill task %s: %w", id, err)
 	}
 
+	return nil
+}
+
+// StopContainer kills a container's task, tears down its CNI networking,
+// and removes the task, container, and snapshot. This is the full cleanup
+// path used when a workload is unassigned. It is idempotent — missing
+// containers or tasks are treated as already cleaned up.
+func (c *Client) StopContainer(id string, cni *CNI, ports []types.PortMapping) error {
+	ctx := c.Context()
+
+	container, err := c.inner.LoadContainer(ctx, id)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("load container %s: %w", id, err)
+	}
+
+	task, err := container.Task(ctx, nil)
+	if err == nil {
+		// Capture netns path before the task is gone, for CNI teardown.
+		netnsPath := fmt.Sprintf("/proc/%d/ns/net", task.Pid())
+
+		// Kill and wait for exit.
+		exitCh, waitErr := task.Wait(ctx)
+		if waitErr == nil {
+			task.Kill(ctx, syscall.SIGKILL)
+			select {
+			case <-exitCh:
+			case <-time.After(10 * time.Second):
+				log.Printf("warn: timeout waiting for %s to exit", id)
+			}
+		}
+
+		// Tear down CNI networking before deleting the task.
+		if cni != nil {
+			if err := cni.Teardown(ctx, id, netnsPath, ports); err != nil {
+				log.Printf("warn: cni teardown %s: %v", id, err)
+			}
+		}
+
+		if _, err := task.Delete(ctx); err != nil {
+			log.Printf("warn: task delete %s: %v", id, err)
+		}
+	}
+
+	if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
+		if !errdefs.IsNotFound(err) {
+			return fmt.Errorf("delete container %s: %w", id, err)
+		}
+	}
+
+	log.Printf("stopped and cleaned up container %s", id)
 	return nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	goruntime "runtime"
+	"sync"
 	"time"
 
 	smithruntime "github.com/kkjorsvik/smith/internal/runtime"
@@ -31,6 +32,8 @@ type Agent struct {
 	httpClient *http.Client
 	serverTLS  *tls.Config
 	cni        *smithruntime.CNI
+	mu         sync.Mutex
+	ports      map[string][]types.PortMapping // workloadID -> ports
 }
 
 // New returns an Agent.
@@ -65,6 +68,7 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 		httpClient: httpClient,
 		serverTLS:  serverTLS,
 		cni:        cni,
+		ports:      make(map[string][]types.PortMapping),
 	}
 }
 
@@ -181,6 +185,10 @@ func (a *Agent) handleAssign(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("agent: received assignment for %s", wl.ID)
 
+	a.mu.Lock()
+	a.ports[wl.ID] = wl.Ports
+	a.mu.Unlock()
+
 	go func() {
 		image, err := a.client.GetImage(wl.Image)
 		if err != nil {
@@ -224,8 +232,13 @@ func (a *Agent) handleUnassign(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("agent: received unassign for %s", id)
 
-	if err := a.client.KillContainer(id, true); err != nil {
-		log.Printf("agent: kill %s: %v", id, err)
+	a.mu.Lock()
+	ports := a.ports[id]
+	delete(a.ports, id)
+	a.mu.Unlock()
+
+	if err := a.client.StopContainer(id, a.cni, ports); err != nil {
+		log.Printf("agent: stop %s: %v", id, err)
 	}
 
 	w.WriteHeader(http.StatusOK)
