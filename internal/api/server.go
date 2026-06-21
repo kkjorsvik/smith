@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	acmedns "github.com/kkjorsvik/smith/internal/acme"
 	"github.com/kkjorsvik/smith/internal/reconciler"
@@ -32,6 +34,7 @@ type Server struct {
 	internalAddr string
 	tlsCfg       *tls.Config
 	statusFunc   func() map[string]map[string]runtime.ContainerStatus
+	token        string
 }
 
 // New returns a Server with a public API (hardcoded on :443 via autocert)
@@ -53,16 +56,56 @@ func (s *Server) SetStatusFunc(f func() map[string]map[string]runtime.ContainerS
 	s.statusFunc = f
 }
 
+// LoadToken reads the API bearer token from the given file path.
+// The token is trimmed of surrounding whitespace. If the file is
+// missing or empty, returns an error — the server should refuse to
+// start the public API without a token.
+func (s *Server) LoadToken(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read token file %s: %w", path, err)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return fmt.Errorf("token file %s is empty", path)
+	}
+	s.token = token
+	return nil
+}
+
+// requireAuth wraps a handler with bearer token authentication.
+// Expects an "Authorization: Bearer <token>" header matching the
+// configured token.
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			httpError(w, fmt.Errorf("missing or malformed Authorization header"), http.StatusUnauthorized)
+			return
+		}
+
+		token := strings.TrimPrefix(auth, prefix)
+		// Constant-time comparison to avoid timing attacks.
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) != 1 {
+			httpError(w, fmt.Errorf("invalid token"), http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 // Start registers routes and begins listening in goroutines.
 func (s *Server) Start() {
 	// Public mux — workload API over HTTPS via autocert.
 	publicMux := http.NewServeMux()
-	publicMux.HandleFunc("GET /workloads", s.listWorkloads)
-	publicMux.HandleFunc("POST /workloads", s.addWorkload)
-	publicMux.HandleFunc("DELETE /workloads/{id}", s.removeWorkload)
-	publicMux.HandleFunc("GET /status", s.status)
-	publicMux.HandleFunc("GET /nodes", s.listNodes)
-	publicMux.HandleFunc("GET /assignments", s.listAssignments)
+	publicMux.HandleFunc("GET /workloads", s.requireAuth(s.listWorkloads))
+	publicMux.HandleFunc("POST /workloads", s.requireAuth(s.addWorkload))
+	publicMux.HandleFunc("DELETE /workloads/{id}", s.requireAuth(s.removeWorkload))
+	publicMux.HandleFunc("GET /status", s.requireAuth(s.status))
+	publicMux.HandleFunc("GET /nodes", s.requireAuth(s.listNodes))
+	publicMux.HandleFunc("GET /assignments", s.requireAuth(s.listAssignments))
 
 	// Internal mux — node registration and heartbeat over mTLS.
 	internalMux := http.NewServeMux()
