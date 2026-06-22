@@ -57,10 +57,9 @@ func main() {
 	}
 	defer client.Close()
 
-	if err := client.CleanupAll(); err != nil {
-		log.Fatalf("agent: cleanup: %v", err)
-	}
-
+	// agent.New initializes CNI; ghost-container cleanup (which needs CNI
+	// to release stale IP allocations) runs inside a.Start() before the
+	// agent registers with the control plane.
 	a := agent.New(*id, *addr, *serverAddr, client, clientTLS, serverTLS)
 	if err := a.Start(); err != nil {
 		log.Fatalf("agent: start: %v", err)

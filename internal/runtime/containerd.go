@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -21,7 +23,14 @@ import (
 const (
 	SmithNamespace = "smith"
 	SocketPath     = defaults.DefaultAddress
+	// LogDir holds per-container stdout/stderr log files.
+	LogDir = "/var/lib/smith/logs"
 )
+
+// LogPath returns the path to a container's log file.
+func LogPath(id string) string {
+	return filepath.Join(LogDir, id+".log")
+}
 
 // Client wraps the containerd client with smith-specific defaults.
 type Client struct {
@@ -171,8 +180,13 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	}()
 
 	// NewTask creates the actual OS process from the container spec.
-	// cio.WithStdio wires the container's stdin/stdout/stderr to ours.
-	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStdio))
+	// Output is redirected to a per-container log file on disk rather than
+	// the agent's own terminal, so it can be retrieved later.
+	if err := os.MkdirAll(LogDir, 0755); err != nil {
+		return 0, fmt.Errorf("create log dir: %w", err)
+	}
+	logPath := LogPath(opts.ID)
+	task, err := container.NewTask(ctx, cio.LogFile(logPath))
 	if err != nil {
 		return 0, fmt.Errorf("create task for %s: %w", opts.ID, err)
 	}
@@ -199,10 +213,8 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	if opts.CNI != nil {
 		netnsPath = fmt.Sprintf("/proc/%d/ns/net", task.Pid())
 		if _, err := opts.CNI.Setup(ctx, opts.ID, netnsPath, opts.Ports); err != nil {
-			log.Printf("RunContainer %s FAILED at cni-setup: %v", opts.ID, err)
 			return 0, fmt.Errorf("cni setup for %s: %w", opts.ID, err)
 		}
-		log.Printf("RunContainer %s: CNI setup OK, netns=%s", opts.ID, netnsPath)
 	}
 
 	// Tear down CNI on any early error return after setup succeeded. Runs
@@ -224,13 +236,10 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	// the exit event if Wait is called after Start.
 	exitCh, err := task.Wait(ctx)
 	if err != nil {
-		log.Printf("RunContainer %s FAILED at task-wait: %v", opts.ID, err)
 		return 0, fmt.Errorf("wait setup for %s: %w", opts.ID, err)
 	}
 
-	log.Printf("RunContainer %s: starting task", opts.ID)
 	if err := task.Start(ctx); err != nil {
-		log.Printf("RunContainer %s FAILED at task-start: %v", opts.ID, err)
 		return 0, fmt.Errorf("start task %s: %w", opts.ID, err)
 	}
 
@@ -360,6 +369,11 @@ func (c *Client) StopContainer(id string, cni *CNI, ports []types.PortMapping) e
 		}
 	}
 
+	// Remove the container's log file.
+	if err := os.Remove(LogPath(id)); err != nil && !os.IsNotExist(err) {
+		log.Printf("warn: remove log file for %s: %v", id, err)
+	}
+
 	log.Printf("stopped and cleaned up container %s", id)
 	return nil
 }
@@ -420,7 +434,7 @@ func (c *Client) ListRunning() (map[string]ContainerStatus, error) {
 // Cleanup force-removes a container and its snapshot regardless of
 // task state. Used on startup to clear ghost containers left by a
 // previous unclean shutdown.
-func (c *Client) Cleanup(id string) error {
+func (c *Client) Cleanup(id string, cni *CNI) error {
 	ctx := c.Context()
 
 	container, err := c.inner.LoadContainer(ctx, id)
@@ -431,27 +445,51 @@ func (c *Client) Cleanup(id string) error {
 		return fmt.Errorf("load container %s: %w", id, err)
 	}
 
-	// If a task exists, wait for it to exit after killing it.
-	task, err := container.Task(ctx, nil)
-	if err == nil {
-		exitCh, err := task.Wait(ctx)
-		if err == nil {
+	// Attempt to capture a netns path if a task still exists.
+	netnsPath := ""
+	task, taskErr := container.Task(ctx, nil)
+	if taskErr == nil {
+		netnsPath = fmt.Sprintf("/proc/%d/ns/net", task.Pid())
+
+		exitCh, waitErr := task.Wait(ctx)
+		if waitErr == nil {
 			task.Kill(ctx, syscall.SIGKILL)
-			<-exitCh
+			select {
+			case <-exitCh:
+			case <-time.After(10 * time.Second):
+			}
 		}
-		task.Delete(ctx)
+		task.Delete(ctx, containerd.WithProcessKill)
+	}
+
+	// Tear down CNI networking to release the IP allocation. This is
+	// best-effort: the netns may be gone, but host-local releases the
+	// allocation by container ID regardless.
+	if cni != nil {
+		if err := cni.Teardown(ctx, id, netnsPath, nil); err != nil {
+			log.Printf("warn: cni cleanup teardown %s: %v", id, err)
+		}
 	}
 
 	if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
-		return fmt.Errorf("delete container %s: %w", id, err)
+		if !errdefs.IsNotFound(err) {
+			return fmt.Errorf("delete container %s: %w", id, err)
+		}
 	}
 
+	// Remove the container's log file so stale logs don't accumulate.
+	if err := os.Remove(LogPath(id)); err != nil && !os.IsNotExist(err) {
+		log.Printf("warn: remove log file for %s: %v", id, err)
+	}
+
+	log.Printf("cleanup: removed ghost container %s", id)
 	return nil
 }
 
-// CleanupAll removes all containers in the smith namespace.
-// Call this on startup before the reconciler starts.
-func (c *Client) CleanupAll() error {
+// CleanupAll removes all containers in the smith namespace, releasing
+// each one's CNI IP allocation. Call this on startup before the
+// reconciler starts. cni may be nil on nodes that run no containers.
+func (c *Client) CleanupAll(cni *CNI) error {
 	ctx := c.Context()
 
 	containers, err := c.inner.Containers(ctx)
@@ -460,10 +498,8 @@ func (c *Client) CleanupAll() error {
 	}
 
 	for _, container := range containers {
-		if err := c.Cleanup(container.ID()); err != nil {
+		if err := c.Cleanup(container.ID(), cni); err != nil {
 			log.Printf("cleanup %s: %v", container.ID(), err)
-		} else {
-			log.Printf("cleanup: removed ghost container %s", container.ID())
 		}
 	}
 

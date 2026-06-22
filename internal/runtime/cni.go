@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	gocni "github.com/containerd/go-cni"
 	"github.com/kkjorsvik/smith/internal/types"
@@ -102,6 +103,14 @@ func (c *CNI) Teardown(ctx context.Context, id, netnsPath string, ports []types.
 	}
 
 	if err := c.cni.Remove(ctx, id, netnsPath, opts...); err != nil {
+		// When StopContainer and the RunContainer exit path both tear down
+		// the same container, the second portmap delete hits an already-gone
+		// chain. That is harmless — treat it as success.
+		msg := err.Error()
+		if strings.Contains(msg, "No chain/target/match by that name") ||
+			strings.Contains(msg, "no chain") {
+			return nil
+		}
 		return fmt.Errorf("cni remove for %s: %w", id, err)
 	}
 

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -35,6 +36,7 @@ type Server struct {
 	tlsCfg       *tls.Config
 	statusFunc   func() map[string]map[string]runtime.ContainerStatus
 	token        string
+	agentClient  *http.Client
 }
 
 // New returns a Server with a public API (hardcoded on :443 via autocert)
@@ -54,6 +56,13 @@ func New(store reconciler.Storer, client *runtime.Client, reg *registry.Registry
 // container status (provided by the reconciler).
 func (s *Server) SetStatusFunc(f func() map[string]map[string]runtime.ContainerStatus) {
 	s.statusFunc = f
+}
+
+// SetAgentClient wires in the mTLS HTTP client used to reach agents
+// (for log proxying). It must not have a Timeout set, since follow-mode
+// log streaming is a long-lived connection.
+func (s *Server) SetAgentClient(c *http.Client) {
+	s.agentClient = c
 }
 
 // LoadToken reads the API bearer token from the given file path.
@@ -106,6 +115,7 @@ func (s *Server) Start() {
 	publicMux.HandleFunc("GET /status", s.requireAuth(s.status))
 	publicMux.HandleFunc("GET /nodes", s.requireAuth(s.listNodes))
 	publicMux.HandleFunc("GET /assignments", s.requireAuth(s.listAssignments))
+	publicMux.HandleFunc("GET /workloads/{id}/logs", s.requireAuth(s.workloadLogs))
 
 	// Internal mux — node registration and heartbeat over mTLS.
 	internalMux := http.NewServeMux()
@@ -416,6 +426,83 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listAssignments(w http.ResponseWriter, r *http.Request) {
 	assignments := s.scheduler.ListAssignments()
 	writeJSON(w, http.StatusOK, assignments)
+}
+
+// workloadLogs proxies a workload's container logs from the agent it is
+// assigned to, streaming bytes back to the client. It propagates the
+// follow query parameter and tears down the upstream connection when the
+// client disconnects (via the request context).
+func (s *Server) workloadLogs(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		httpError(w, fmt.Errorf("missing id"), http.StatusBadRequest)
+		return
+	}
+
+	assignment, ok := s.scheduler.GetAssignment(id)
+	if !ok {
+		httpError(w, fmt.Errorf("workload %s not assigned to any node", id), http.StatusNotFound)
+		return
+	}
+
+	node, ok := s.registry.Get(assignment.NodeID)
+	if !ok {
+		httpError(w, fmt.Errorf("node %s not found", assignment.NodeID), http.StatusNotFound)
+		return
+	}
+
+	if s.agentClient == nil {
+		httpError(w, fmt.Errorf("agent client not configured"), http.StatusInternalServerError)
+		return
+	}
+
+	follow := r.URL.Query().Get("follow")
+	url := fmt.Sprintf("https://%s/logs/%s", node.Addr, id)
+	if follow == "true" {
+		url += "?follow=true"
+	}
+
+	// Build an upstream request tied to the client's context so that
+	// when the client disconnects, the upstream connection is cancelled.
+	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		httpError(w, fmt.Errorf("build upstream request: %w", err), http.StatusInternalServerError)
+		return
+	}
+
+	resp, err := s.agentClient.Do(upReq)
+	if err != nil {
+		httpError(w, fmt.Errorf("connect to agent %s: %w", node.ID, err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		httpError(w, fmt.Errorf("streaming unsupported"), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			flusher.Flush()
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // writeJSON encodes v as JSON and writes it to w with the given status code.

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -85,6 +86,14 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 // Start registers with the control plane, starts the heartbeat loop,
 // and starts the agent's HTTP server in goroutines.
 func (a *Agent) Start() error {
+	// Clear ghost containers left by a previous unclean shutdown, releasing
+	// their CNI IP allocations. Runs after agent.New initialized a.cni and
+	// before registration so stale host-local IPAM entries don't cause
+	// "duplicate allocation" failures when workloads are re-assigned.
+	if err := a.client.CleanupAll(a.cni); err != nil {
+		return fmt.Errorf("cleanup: %w", err)
+	}
+
 	if err := a.register(); err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
@@ -177,6 +186,7 @@ func (a *Agent) serveHTTP(tlsCfg *tls.Config) {
 	mux.HandleFunc("POST /assign", a.handleAssign)
 	mux.HandleFunc("DELETE /assign/{id}", a.handleUnassign)
 	mux.HandleFunc("GET /status", a.handleStatus)
+	mux.HandleFunc("GET /logs/{id}", a.handleLogs)
 
 	server := &http.Server{
 		Addr:      a.addr,
@@ -281,6 +291,64 @@ func (a *Agent) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(observed)
+}
+
+// handleLogs streams a container's log file to the client. With
+// ?follow=true it keeps the connection open and streams new content as
+// it is written (like tail -f), until the client disconnects.
+func (a *Agent) handleLogs(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+
+	logPath := smithruntime.LogPath(id)
+	f, err := os.Open(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "no logs for "+id, http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+
+	follow := r.URL.Query().Get("follow") == "true"
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			flusher.Flush()
+		}
+		if err == io.EOF {
+			if !follow {
+				return
+			}
+			// In follow mode, wait for more data or client disconnect.
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+				continue
+			}
+		}
+		if err != nil && err != io.EOF {
+			return
+		}
+	}
 }
 
 // getCPUCount returns the number of logical CPUs available.

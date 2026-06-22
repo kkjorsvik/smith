@@ -10,6 +10,7 @@ import (
 	"flag"
 	"log"
 	"math/big"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -47,7 +48,8 @@ func runServer() {
 	}
 	defer store.Close()
 
-	if err := client.CleanupAll(); err != nil {
+	// The control plane runs no workloads, so it has no CNI; pass nil.
+	if err := client.CleanupAll(nil); err != nil {
 		log.Fatalf("cleanup failed: %v", err)
 	}
 
@@ -78,8 +80,17 @@ func runServer() {
 	r := reconciler.New(client, store, monitor, reg, sched, clientTLS, 5*time.Second)
 	r.Start()
 
+	// agentClient reaches agents over mTLS for log proxying. It has NO
+	// timeout, because follow-mode log streaming is a long-lived connection.
+	agentClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: clientTLS,
+		},
+	}
+
 	server := api.New(store, client, reg, sched, ":9443", serverTLS)
 	server.SetStatusFunc(r.AggregateStatus)
+	server.SetAgentClient(agentClient)
 
 	if err := server.LoadToken("/etc/smith/token"); err != nil {
 		log.Fatalf("load API token: %v", err)
