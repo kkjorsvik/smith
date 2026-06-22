@@ -32,6 +32,7 @@ type Agent struct {
 	httpClient *http.Client
 	serverTLS  *tls.Config
 	cni        *smithruntime.CNI
+	firewall   *smithruntime.Firewall
 	mu         sync.Mutex
 	ports      map[string][]types.PortMapping // workloadID -> ports
 }
@@ -59,6 +60,14 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 		cni = nil
 	}
 
+	// Firewall is best-effort, like CNI: if iptables is unavailable the
+	// agent still runs, but the operator must manage FORWARD/INPUT rules.
+	fw, err := smithruntime.NewFirewall(smithruntime.BridgeSubnet)
+	if err != nil {
+		log.Printf("agent: firewall init failed, port management disabled: %v", err)
+		fw = nil
+	}
+
 	return &Agent{
 		id:         id,
 		addr:       addr,
@@ -68,6 +77,7 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 		httpClient: httpClient,
 		serverTLS:  serverTLS,
 		cni:        cni,
+		firewall:   fw,
 		ports:      make(map[string][]types.PortMapping),
 	}
 }
@@ -77,6 +87,12 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 func (a *Agent) Start() error {
 	if err := a.register(); err != nil {
 		return fmt.Errorf("register: %w", err)
+	}
+
+	if a.firewall != nil {
+		if err := a.firewall.EnsureForwarding(); err != nil {
+			log.Printf("agent: ensure forwarding: %v", err)
+		}
 	}
 
 	go a.heartbeatLoop()
@@ -189,6 +205,12 @@ func (a *Agent) handleAssign(w http.ResponseWriter, r *http.Request) {
 	a.ports[wl.ID] = wl.Ports
 	a.mu.Unlock()
 
+	if a.firewall != nil && len(wl.Ports) > 0 {
+		if err := a.firewall.OpenPorts(wl.Ports); err != nil {
+			log.Printf("agent: open ports for %s: %v", wl.ID, err)
+		}
+	}
+
 	go func() {
 		image, err := a.client.GetImage(wl.Image)
 		if err != nil {
@@ -239,6 +261,10 @@ func (a *Agent) handleUnassign(w http.ResponseWriter, r *http.Request) {
 
 	if err := a.client.StopContainer(id, a.cni, ports); err != nil {
 		log.Printf("agent: stop %s: %v", id, err)
+	}
+
+	if a.firewall != nil && len(ports) > 0 {
+		a.firewall.ClosePorts(ports)
 	}
 
 	w.WriteHeader(http.StatusOK)

@@ -9,6 +9,10 @@ import (
 	"github.com/kkjorsvik/smith/internal/types"
 )
 
+// BridgeSubnet is the CIDR the smith CNI bridge allocates container IPs
+// from. The firewall and CNI config must agree on this value.
+const BridgeSubnet = "10.22.0.0/16"
+
 // CNI wraps the go-cni library configured for smith's network.
 type CNI struct {
 	cni gocni.CNI

@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/route53 v1.63.3
 	github.com/containerd/containerd v1.7.33
 	github.com/containerd/go-cni v1.1.10
+	github.com/coreos/go-iptables v0.7.0
 	github.com/mattn/go-sqlite3 v1.14.46
 	github.com/opencontainers/runtime-spec v1.1.0
 	golang.org/x/crypto v0.53.0
