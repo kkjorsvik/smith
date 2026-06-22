@@ -101,6 +101,8 @@ type RunOptions struct {
 	// Env are environment variables (KEY=VALUE) injected into the
 	// container, merged over the image's defaults.
 	Env map[string]string
+	// Resources, when non-nil, applies CPU and memory cgroup limits.
+	Resources *types.Resources
 }
 
 // RunContainer creates a container, starts it, waits for it to exit,
@@ -124,6 +126,19 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 			envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
 		}
 		specOpts = append(specOpts, oci.WithEnv(envSlice))
+	}
+	if opts.Resources != nil {
+		if opts.Resources.MemoryMB > 0 {
+			memBytes := int64(opts.Resources.MemoryMB) * 1024 * 1024
+			specOpts = append(specOpts, oci.WithMemoryLimit(uint64(memBytes)))
+		}
+		if opts.Resources.CPUMillicores > 0 {
+			// CFS quota/period: 100ms period (the standard default), with
+			// quota = millicores * 100 so 1000 millicores = one full core.
+			period := uint64(100000)
+			quota := int64(opts.Resources.CPUMillicores) * 100
+			specOpts = append(specOpts, oci.WithCPUCFS(quota, period))
+		}
 	}
 
 	// NewContainer creates the metadata record and a fresh writable

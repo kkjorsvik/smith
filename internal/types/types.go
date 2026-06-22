@@ -13,6 +13,17 @@ type Workload struct {
 	HealthCheck *HealthCheck      `json:"health_check,omitempty"`
 	Ports       []PortMapping     `json:"ports,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
+	Resources   *Resources        `json:"resources,omitempty"`
+}
+
+// Resources defines CPU and memory limits for a workload.
+type Resources struct {
+	// CPUMillicores is the CPU limit in millicores. 1000 = one full
+	// core, 500 = half a core. Zero means no CPU limit.
+	CPUMillicores int `json:"cpu_millicores,omitempty"`
+	// MemoryMB is the memory limit in megabytes. Zero means no memory
+	// limit. A container exceeding this will be OOM-killed.
+	MemoryMB int `json:"memory_mb,omitempty"`
 }
 
 // PortMapping maps a port on the host node to a port inside the container.

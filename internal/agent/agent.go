@@ -222,12 +222,13 @@ func (a *Agent) handleAssign(w http.ResponseWriter, r *http.Request) {
 		}
 
 		code, err := a.client.RunContainer(smithruntime.RunOptions{
-			ID:    wl.ID,
-			Image: image,
-			Args:  wl.Args,
-			Ports: wl.Ports,
-			Env:   wl.Env,
-			CNI:   a.cni,
+			ID:        wl.ID,
+			Image:     image,
+			Args:      wl.Args,
+			Ports:     wl.Ports,
+			Env:       wl.Env,
+			Resources: wl.Resources,
+			CNI:       a.cni,
 		})
 		if err != nil {
 			if smithruntime.ErrAlreadyExists(err) {
