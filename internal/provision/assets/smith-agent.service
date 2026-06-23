@@ -1,0 +1,25 @@
+[Unit]
+Description=smith agent (container orchestrator worker)
+Documentation=https://github.com/kkjorsvik/smith
+After=network-online.target containerd.service
+Wants=network-online.target
+Requires=containerd.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/smith/agent.env
+ExecStart=/usr/local/bin/smith-agent \
+  -id ${SMITH_ID} \
+  -addr ${SMITH_ADDR} \
+  -server ${SMITH_SERVER} \
+  -ca ${SMITH_CA} \
+  -cert ${SMITH_CERT} \
+  -key ${SMITH_KEY}
+Restart=on-failure
+RestartSec=5
+# Agent binds :80/:443 (ingress) and :9000, talks to containerd, and programs
+# iptables/netlink — needs full privileges.
+User=root
+
+[Install]
+WantedBy=multi-user.target
