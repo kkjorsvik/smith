@@ -11,6 +11,7 @@ require (
 	github.com/coreos/go-iptables v0.7.0
 	github.com/mattn/go-sqlite3 v1.14.46
 	github.com/opencontainers/runtime-spec v1.1.0
+	github.com/vishvananda/netlink v1.2.1
 	golang.org/x/crypto v0.53.0
 )
 
@@ -64,6 +65,7 @@ require (
 	github.com/opencontainers/selinux v1.13.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/vishvananda/netns v0.0.4 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.45.0 // indirect
 	go.opentelemetry.io/otel v1.21.0 // indirect

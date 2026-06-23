@@ -123,11 +123,14 @@ func (s *Server) Start() {
 	publicMux.HandleFunc("GET /nodes", s.requireAuth(s.listNodes))
 	publicMux.HandleFunc("GET /assignments", s.requireAuth(s.listAssignments))
 	publicMux.HandleFunc("GET /workloads/{id}/logs", s.requireAuth(s.workloadLogs))
+	publicMux.HandleFunc("DELETE /nodes/{id}", s.requireAuth(s.removeNode))
 
-	// Internal mux — node registration and heartbeat over mTLS.
+	// Internal mux — node registration, heartbeat, and route distribution
+	// over mTLS.
 	internalMux := http.NewServeMux()
 	internalMux.HandleFunc("POST /nodes/register", s.registerNode)
 	internalMux.HandleFunc("POST /nodes/{id}/heartbeat", s.heartbeat)
+	internalMux.HandleFunc("GET /nodes/{id}/routes", s.nodeRoutes)
 
 	// Internal mTLS server for agent communication.
 	internalServer := &http.Server{
@@ -448,6 +451,70 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listAssignments(w http.ResponseWriter, r *http.Request) {
 	assignments := s.scheduler.ListAssignments()
 	writeJSON(w, http.StatusOK, assignments)
+}
+
+// nodeRoutes returns the cross-node routing table for the requesting node:
+// one route per other node's container subnet, via that node's host IP. Served
+// on the internal mTLS mux and pulled by agents on their heartbeat cadence.
+func (s *Server) nodeRoutes(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		httpError(w, fmt.Errorf("missing id"), http.StatusBadRequest)
+		return
+	}
+
+	if s.allocator == nil {
+		writeJSON(w, http.StatusOK, []types.Route{})
+		return
+	}
+
+	subnets, err := s.allocator.All()
+	if err != nil {
+		httpError(w, fmt.Errorf("list subnets: %w", err), http.StatusInternalServerError)
+		return
+	}
+
+	routes := make([]types.Route, 0, len(subnets))
+	for nodeID, subnet := range subnets {
+		if nodeID == id {
+			continue // don't route a node to its own subnet
+		}
+		peer, ok := s.registry.Get(nodeID)
+		if !ok {
+			continue // only advertise routes to currently-known nodes
+		}
+		if peer.HostIP == "" {
+			continue // no underlay IP to route via
+		}
+		routes = append(routes, types.Route{Subnet: subnet, Via: peer.HostIP})
+	}
+
+	writeJSON(w, http.StatusOK, routes)
+}
+
+// removeNode decommissions a node: it is removed from the registry, its
+// subnet allocation is released, and its workloads are reassigned to other
+// nodes. Intended for a node being taken out of service — containers still
+// running on it are not actively stopped, so the node should be shut down.
+func (s *Server) removeNode(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		httpError(w, fmt.Errorf("missing id"), http.StatusBadRequest)
+		return
+	}
+
+	s.registry.Remove(id)
+
+	if s.allocator != nil {
+		if err := s.allocator.Release(id); err != nil {
+			httpError(w, fmt.Errorf("release subnet for %s: %w", id, err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	evicted := s.scheduler.ReassignNode(id)
+	log.Printf("api: decommissioned node %s, reassigning %d workloads", id, len(evicted))
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // workloadLogs proxies a workload's container logs from the agent it is

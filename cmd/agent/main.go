@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,6 +17,7 @@ func main() {
 	var (
 		id         = flag.String("id", "", "Unique node ID (e.g. smith-agent-01)")
 		addr       = flag.String("addr", "", "This agent's HTTP address (e.g. 192.168.1.55:9000)")
+		hostIP     = flag.String("hostip", "", "Underlay IP other nodes route container traffic through (default: host part of -addr)")
 		serverAddr = flag.String("server", "", "Control plane internal mTLS address (e.g. smith-server-01.kkjorsvik.com:9443)")
 		caCert     = flag.String("ca", "/etc/smith/certs/ca.crt", "Path to Smith CA cert")
 		cert       = flag.String("cert", "", "Path to this agent's cert")
@@ -39,6 +41,17 @@ func main() {
 		log.Fatal("agent: -key is required")
 	}
 
+	// Resolve the underlay host IP used as the route target by peer nodes.
+	// Defaults to the host portion of -addr.
+	resolvedHostIP := *hostIP
+	if resolvedHostIP == "" {
+		host, _, err := net.SplitHostPort(*addr)
+		if err != nil {
+			log.Fatalf("agent: cannot derive -hostip from -addr %q: %v (pass -hostip)", *addr, err)
+		}
+		resolvedHostIP = host
+	}
+
 	// For outbound calls to the control plane.
 	clientTLS, err := smithtls.ClientConfig(*caCert, *cert, *key)
 	if err != nil {
@@ -60,7 +73,7 @@ func main() {
 	// agent.New initializes CNI; ghost-container cleanup (which needs CNI
 	// to release stale IP allocations) runs inside a.Start() before the
 	// agent registers with the control plane.
-	a := agent.New(*id, *addr, *serverAddr, client, clientTLS, serverTLS)
+	a := agent.New(*id, *addr, resolvedHostIP, *serverAddr, client, clientTLS, serverTLS)
 	if err := a.Start(); err != nil {
 		log.Fatalf("agent: start: %v", err)
 	}

@@ -27,6 +27,7 @@ const (
 type Agent struct {
 	id         string
 	addr       string
+	hostIP     string
 	serverAddr string
 	client     *smithruntime.Client
 	stop       chan struct{}
@@ -34,6 +35,7 @@ type Agent struct {
 	serverTLS  *tls.Config
 	cni        *smithruntime.CNI
 	firewall   *smithruntime.Firewall
+	routeMgr   *smithruntime.RouteManager
 	netCfg     types.NetworkConfig // assigned at registration
 	mu         sync.Mutex
 	ports      map[string][]types.PortMapping // workloadID -> ports
@@ -42,10 +44,11 @@ type Agent struct {
 // New returns an Agent.
 // id is this node's unique name (e.g. "smith-agent-01").
 // addr is this agent's HTTP address the control plane will call back to (e.g. "192.168.1.55:9000").
+// hostIP is the underlay IP other nodes route container traffic through.
 // serverAddr is the control plane's internal mTLS address (e.g. "smith-server-01.kkjorsvik.com:9443").
 // clientTLS authenticates this agent's outbound calls to the control plane;
 // serverTLS requires and verifies client certs on this agent's inbound server.
-func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, serverTLS *tls.Config) *Agent {
+func New(id, addr, hostIP, serverAddr string, client *smithruntime.Client, clientTLS, serverTLS *tls.Config) *Agent {
 	httpClient := &http.Client{
 		Timeout: serverTimeout,
 		Transport: &http.Transport{
@@ -66,6 +69,7 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 	return &Agent{
 		id:         id,
 		addr:       addr,
+		hostIP:     hostIP,
 		serverAddr: serverAddr,
 		client:     client,
 		stop:       make(chan struct{}),
@@ -99,6 +103,14 @@ func (a *Agent) Start() error {
 			cni = nil
 		}
 		a.cni = cni
+
+		// Route manager installs routes to peer subnets (Commit 3).
+		rm, err := smithruntime.NewRouteManager(smithruntime.BridgeSubnet, netCfg.Subnet)
+		if err != nil {
+			log.Printf("agent: route manager init failed, cross-node routing disabled: %v", err)
+		} else {
+			a.routeMgr = rm
+		}
 	} else {
 		log.Printf("agent: control plane assigned no subnet; falling back to static CNI config")
 		cni, err := smithruntime.NewCNI()
@@ -132,6 +144,7 @@ func (a *Agent) Start() error {
 
 	go a.heartbeatLoop()
 	go a.serveHTTP(a.serverTLS)
+	go a.routeSyncLoop()
 
 	return nil
 }
@@ -175,6 +188,7 @@ func (a *Agent) register() (types.NetworkConfig, error) {
 	node := types.Node{
 		ID:       a.id,
 		Addr:     a.addr,
+		HostIP:   a.hostIP,
 		CPU:      getCPUCount(),
 		MemoryMB: getMemoryMB(),
 	}
@@ -237,6 +251,60 @@ func (a *Agent) sendHeartbeat() error {
 	}
 
 	return nil
+}
+
+// routeSyncLoop periodically pulls this node's cross-node routing table from
+// the control plane and reconciles kernel routes, so a newly-added node's
+// subnet becomes reachable automatically within one interval.
+func (a *Agent) routeSyncLoop() {
+	if a.routeMgr == nil {
+		return
+	}
+
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	a.syncRoutes() // sync once immediately on start
+	for {
+		select {
+		case <-ticker.C:
+			a.syncRoutes()
+		case <-a.stop:
+			return
+		}
+	}
+}
+
+// syncRoutes fetches and applies the routing table once.
+func (a *Agent) syncRoutes() {
+	routes, err := a.fetchRoutes()
+	if err != nil {
+		log.Printf("agent: fetch routes: %v", err)
+		return
+	}
+	if err := a.routeMgr.Sync(routes); err != nil {
+		log.Printf("agent: sync routes: %v", err)
+	}
+}
+
+// fetchRoutes pulls this node's routing table from the control plane.
+func (a *Agent) fetchRoutes() ([]types.Route, error) {
+	url := fmt.Sprintf("https://%s/nodes/%s/routes", a.serverAddr, a.id)
+	resp, err := a.httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("get routes: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("routes failed: status %d", resp.StatusCode)
+	}
+
+	var routes []types.Route
+	if err := json.NewDecoder(resp.Body).Decode(&routes); err != nil {
+		return nil, fmt.Errorf("decode routes: %w", err)
+	}
+	return routes, nil
 }
 
 // serveHTTP starts the agent's HTTP server so the control plane can

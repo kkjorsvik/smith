@@ -36,6 +36,13 @@ type NetworkConfig struct {
 	Gateway string `json:"gateway"`
 }
 
+// Route is one entry in a node's cross-node container routing table: reach
+// Subnet (a peer's container CIDR) via Via (that peer's underlay host IP).
+type Route struct {
+	Subnet string `json:"subnet"` // e.g. "10.22.4.0/24"
+	Via    string `json:"via"`    // e.g. "192.168.1.56"
+}
+
 // PortMapping maps a port on the host node to a port inside the container.
 type PortMapping struct {
 	// HostPort is the port exposed on the agent node's host network.
@@ -81,8 +88,12 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 // Node represents a worker node registered with the control plane.
 type Node struct {
-	ID            string    `json:"id"`
-	Addr          string    `json:"addr"`
+	ID   string `json:"id"`
+	Addr string `json:"addr"`
+	// HostIP is the underlay IP other nodes route container traffic through.
+	// It may differ from Addr's host (the API bind address); used as the
+	// Via for cross-node routes.
+	HostIP        string    `json:"host_ip"`
 	LastHeartbeat time.Time `json:"last_heartbeat"`
 	CPU           int       `json:"cpu"`
 	MemoryMB      int       `json:"memory_mb"`
