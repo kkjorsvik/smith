@@ -24,6 +24,7 @@ certificate obtained via the ACME **DNS-01** challenge (Route 53).
 - [Filesystem layout & fixed values](#filesystem-layout--fixed-values)
 - [Running the control plane](#running-the-control-plane)
 - [Running an agent](#running-an-agent)
+- [Provisioning fresh nodes (scripts)](#provisioning-fresh-nodes-scripts)
 - [Workloads](#workloads)
 - [API reference](#api-reference)
 - [How it works](#how-it-works)
@@ -116,6 +117,11 @@ Two trust boundaries:
 - **containerd** running on every host (control plane and agents), reachable at
   its default socket. The server and agent connect to the local containerd on
   startup and clean up the `smith` namespace.
+- **CNI plugins** (`bridge`, `host-local`, `portmap` from
+  [containernetworking/plugins](https://github.com/containernetworking/plugins))
+  in `/opt/cni/bin` on **agent** hosts — the per-node bridge network needs them.
+  The control plane runs no workloads and needs none. (The agent setup script
+  installs these for you; see [Provisioning](#provisioning-fresh-nodes-scripts).)
 - **Root / privileged access** on each host — binding `:443`/`:80`/`:9443`,
   talking to the containerd socket, and writing `/etc/smith` and `/var/lib/smith`
   generally require it.
@@ -163,6 +169,15 @@ This writes into `-out`:
 | `ca.crt`, `ca.key` | The Smith CA (10-year validity). **`ca.key` must never leave the host that generated it.** |
 | `server.crt`, `server.key` | Control-plane identity, CN/SAN `smith-server-01.kkjorsvik.com` (2-year validity) |
 | `<label>.crt`, `<label>.key` | One pair per `-hosts` entry, named from the first hostname label — e.g. `smith-agent-01.kkjorsvik.com` → `smith-agent-01.crt` / `smith-agent-01.key` |
+
+> **`gencerts` reuses an existing CA.** If `ca.crt`/`ca.key` are already present
+> in `-out`, it loads and keeps them, only (re)issuing the server + listed agent
+> leaves. So re-running it to add a host is safe — it never re-keys the cluster.
+> Pass `-force-ca` to deliberately regenerate the CA (destructive: invalidates
+> every existing cert). Private keys are written `0600`.
+>
+> To add an agent **after** the cluster is up, prefer `add-agent` (below) — it
+> issues one leaf against the existing CA and packages a ready-to-deploy bundle.
 
 Every leaf certificate carries **both** `clientAuth` and `serverAuth` extended
 key usages, so each component uses its single cert for both inbound serving and
@@ -282,6 +297,66 @@ On startup the agent connects to its local containerd (cleaning up the `smith`
 namespace), registers with the control plane over mTLS, starts a 10s heartbeat
 loop, and serves its own mTLS API so the control plane can push assignments and
 query container status.
+
+---
+
+## Provisioning fresh nodes (scripts)
+
+`scripts/` and the `add-agent` subcommand automate standing up boxes on a fresh
+Ubuntu server (`apt` + systemd). Prerequisites become automatic: the server
+script installs containerd; the agent script installs containerd **and** the
+pinned CNI plugins into `/opt/cni/bin`.
+
+### Control plane
+
+Build `smith-server`, then on the control-plane box:
+
+```bash
+sudo ./scripts/setup-server.sh bin/smith-server
+```
+
+It installs containerd, lays out `/etc/smith` + `/var/lib/smith`, generates
+`/etc/smith/token`, bootstraps the CA + server cert (via `gencerts`), installs
+`bin/` to `/usr/local/bin`, and enables `smith-server.service`. Re-running is a
+no-op (token + CA preserved). Provide AWS creds for the public `:443` cert via
+`/etc/smith/server.env`, an instance role, or `~/.aws` (see the script's
+closing notes), then `systemctl restart smith-server`.
+
+### Adding an agent
+
+Run **on the control plane** (where `ca.key` lives), with the agent binary built:
+
+```bash
+sudo ./bin/smith-server add-agent \
+  -host   smith-agent-03.kkjorsvik.com \
+  -binary bin/smith-agent
+# writes ./smith-agent-03.tar.gz
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-host` | _(required)_ | Agent hostname / cert SAN |
+| `-id` | first label of `-host` | Node id (`smith-agent-03`) |
+| `-addr` | `<host>:9000` | mTLS callback address |
+| `-server` | `smith-server-01.kkjorsvik.com:9443` | Control-plane internal address |
+| `-out` | `/etc/smith/certs` | Cert dir — **must already contain the CA** |
+| `-binary` | `bin/smith-agent` | Agent binary to embed in the bundle |
+| `-bundle` | `./<id>.tar.gz` | Output tarball path |
+
+`add-agent` issues one leaf against the existing CA (never regenerates it),
+verifies it chains, and packages a self-contained tarball: the agent's
+`ca.crt` + leaf cert/key, an `agent.env`, the setup script, the systemd unit,
+and the `smith-agent` binary. **`ca.key` is never bundled.** Then on the new box:
+
+```bash
+scp smith-agent-03.tar.gz newbox:~/
+ssh newbox 'tar xzf smith-agent-03.tar.gz && cd smith-agent-03 && sudo ./setup.sh'
+```
+
+`setup.sh` installs containerd + CNI plugins, drops the certs/binary/unit into
+place, and starts `smith-agent.service`. The node then pulls its subnet, routes,
+services, ingress rules, and the wildcard cert from the control plane on its own
+— no further per-node configuration.
 
 ---
 
@@ -464,11 +539,14 @@ internal/
   api/           control-plane HTTP APIs (public :443, internal :9443)
   health/        health-check Monitor (http/exec probes)
   reconciler/    reconcile loop, push tracking, status aggregation, SQLite store
+  provision/     agent deploy-bundle builder (+ embedded setup.sh / unit)
   registry/      node registry + liveness (heartbeat tracking)
   runtime/       containerd client wrapper
   scheduler/     least-loaded placement + assignment tracking
   tls/           ServerConfig / ClientConfig helpers (mTLS, TLS 1.3)
   types/         shared types (Workload, Node, Assignment, HealthCheck)
+scripts/         setup-server.sh + systemd unit (control-plane provisioning)
+docs/specs/      design specs, one per feature
 ```
 
 ---

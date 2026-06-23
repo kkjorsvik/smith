@@ -1,0 +1,20 @@
+[Unit]
+Description=smith control plane (container orchestrator)
+Documentation=https://github.com/kkjorsvik/smith
+After=network-online.target containerd.service
+Wants=network-online.target
+Requires=containerd.service
+
+[Service]
+Type=simple
+# Optional: AWS creds for the public :443 Let's Encrypt cert (DNS-01 / Route 53).
+# Leading "-" makes it optional — the internal mTLS plane works without it.
+EnvironmentFile=-/etc/smith/server.env
+ExecStart=/usr/local/bin/smith-server
+Restart=on-failure
+RestartSec=5
+# Binds :443/:9443, talks to containerd, reads /etc/smith — needs privileges.
+User=root
+
+[Install]
+WantedBy=multi-user.target
