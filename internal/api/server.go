@@ -23,6 +23,7 @@ import (
 	"github.com/kkjorsvik/smith/internal/runtime"
 	"github.com/kkjorsvik/smith/internal/scheduler"
 	"github.com/kkjorsvik/smith/internal/types"
+	"github.com/kkjorsvik/smith/internal/ui"
 	"golang.org/x/crypto/acme"
 )
 
@@ -123,6 +124,11 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) Start() {
 	// Public mux — workload API over HTTPS via autocert.
 	publicMux := http.NewServeMux()
+
+	// Read-only dashboard (unauthenticated app shell; its data fetches use the
+	// bearer token). Served at exactly "/" and "/ui".
+	publicMux.HandleFunc("GET /{$}", ui.Handler())
+	publicMux.HandleFunc("GET /ui", ui.Handler())
 	publicMux.HandleFunc("GET /workloads", s.requireAuth(s.listWorkloads))
 	publicMux.HandleFunc("POST /workloads", s.requireAuth(s.addWorkload))
 	publicMux.HandleFunc("DELETE /workloads/{id}", s.requireAuth(s.removeWorkload))

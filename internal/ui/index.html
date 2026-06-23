@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smith</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3;
+    --muted: #8b949e; --accent: #2f81f7; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); z-index: 5;
+  }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: 1px; }
+  header .grow { flex: 1; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  button {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; cursor: pointer; font: inherit; font-size: 12px;
+  }
+  button:hover { border-color: var(--accent); }
+  main { padding: 20px; max-width: 1200px; margin: 0 auto; }
+  section { margin-bottom: 28px; }
+  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 0 0 10px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.bad { color: var(--bad); border-color: var(--bad); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .replica { display: flex; gap: 10px; align-items: center; padding: 2px 0; }
+  .replica .id { color: var(--muted); min-width: 160px; }
+  .ip { color: var(--accent); }
+  .muted { color: var(--muted); }
+  .link { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .link:hover { text-decoration: underline; }
+  .empty { color: var(--muted); padding: 12px; }
+  #err { background: #3d1518; border: 1px solid var(--bad); color: #ffb4ab; padding: 8px 12px; border-radius: 6px; margin-bottom: 16px; display: none; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: none; align-items: center; justify-content: center; z-index: 20; }
+  .overlay.show { display: flex; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: min(90vw, 760px); max-height: 85vh; display: flex; flex-direction: column; }
+  .card h3 { margin: 0 0 12px; }
+  .card input { width: 100%; padding: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); font: inherit; }
+  .card .row { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
+  pre#logbody { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow: auto; flex: 1; margin: 0; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>smith</h1>
+  <span class="grow"></span>
+  <span class="meta" id="updated"></span>
+  <button id="refresh">Refresh</button>
+  <button id="forget">Forget token</button>
+</header>
+
+<main>
+  <div id="err"></div>
+  <section><h2>Nodes</h2><div id="nodes"></div></section>
+  <section><h2>Workloads</h2><div id="workloads"></div></section>
+  <section><h2>Services</h2><div id="services"></div></section>
+</main>
+
+<div class="overlay" id="gate">
+  <div class="card">
+    <h3>API token</h3>
+    <div class="muted" style="margin-bottom:8px">Enter the bearer token (contents of /etc/smith/token).</div>
+    <input id="tokenInput" type="password" placeholder="bearer token" autocomplete="off">
+    <div class="row"><button id="tokenSave">Save</button></div>
+  </div>
+</div>
+
+<div class="overlay" id="logs">
+  <div class="card">
+    <h3 id="logtitle">logs</h3>
+    <pre id="logbody">…</pre>
+    <div class="row"><button id="logclose">Close</button></div>
+  </div>
+</div>
+
+<script>
+const TOKEN_KEY = "smith_token";
+let token = localStorage.getItem(TOKEN_KEY) || "";
+
+const $ = (id) => document.getElementById(id);
+
+// h() builds DOM safely: text goes through createTextNode, attributes through
+// setAttribute, handlers through addEventListener — no HTML parsing of data.
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null) continue;
+    if (k === "class") e.className = v;
+    else if (k.slice(0, 2) === "on" && typeof v === "function") e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) {
+    if (c == null) continue;
+    e.append(c.nodeType ? c : document.createTextNode(String(c)));
+  }
+  return e;
+}
+
+function showGate(show) { $("gate").classList.toggle("show", show); if (show) $("tokenInput").focus(); }
+
+async function api(path) {
+  const res = await fetch(path, { headers: { "Authorization": "Bearer " + token } });
+  if (res.status === 401) { token = ""; localStorage.removeItem(TOKEN_KEY); showGate(true); throw new Error("unauthorized"); }
+  if (!res.ok) throw new Error(path + ": " + res.status);
+  return res.json();
+}
+
+function err(msg) {
+  const e = $("err");
+  if (!msg) { e.style.display = "none"; return; }
+  e.textContent = msg; e.style.display = "block";
+}
+
+async function refresh() {
+  if (!token) { showGate(true); return; }
+  try {
+    const [nodes, workloads, status, assignments, services] = await Promise.all([
+      api("/nodes"), api("/workloads"), api("/status"), api("/assignments"), api("/services"),
+    ]);
+    err(null);
+
+    const byReplica = {};
+    for (const [nodeID, reps] of Object.entries(status || {})) {
+      for (const [rid, cs] of Object.entries(reps || {})) byReplica[rid] = { ...cs, node: nodeID };
+    }
+    const parentOf = {};
+    for (const a of assignments || []) parentOf[a.workload_id] = a.parent_id || "";
+
+    renderNodes(nodes || [], byReplica);
+    renderWorkloads(workloads || [], byReplica);
+    renderServices(services || [], byReplica, parentOf);
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    if (e.message !== "unauthorized") err("Failed to load: " + e.message);
+  }
+}
+
+function badge(text, cls) { return h("span", { class: "badge " + (cls || "") }, text); }
+
+function aliveBadge(node) {
+  const age = (Date.now() - Date.parse(node.last_heartbeat)) / 1000;
+  return age < 30 ? badge("alive", "ok") : badge("dead", "bad");
+}
+
+function statusBadge(st) {
+  if (!st) return badge("pending", "warn");
+  const cls = st.status === "running" ? "ok" : (st.status === "stopped" ? "bad" : "warn");
+  return badge(st.status, cls);
+}
+
+function table(headers, rows) {
+  return h("table",
+    {},
+    h("thead", {}, h("tr", {}, headers.map(t => h("th", {}, t)))),
+    h("tbody", {}, rows));
+}
+
+function renderNodes(nodes, byReplica) {
+  const c = $("nodes");
+  if (!nodes.length) { c.replaceChildren(h("div", { class: "empty" }, "no nodes registered")); return; }
+  const running = {};
+  for (const r of Object.values(byReplica)) if (r.status === "running") running[r.node] = (running[r.node] || 0) + 1;
+  const rows = nodes.map(n => h("tr", {},
+    h("td", {}, n.id),
+    h("td", {}, n.host_ip || ""),
+    h("td", { class: "num" }, String(n.cpu)),
+    h("td", { class: "num" }, n.memory_mb + " MB"),
+    h("td", { class: "num" }, String(running[n.id] || 0)),
+    h("td", {}, aliveBadge(n)),
+  ));
+  c.replaceChildren(table(["ID", "Host IP", "CPU", "Memory", "Running", "State"], rows));
+}
+
+function renderWorkloads(workloads, byReplica) {
+  const c = $("workloads");
+  if (!workloads.length) { c.replaceChildren(h("div", { class: "empty" }, "no workloads")); return; }
+  const rows = workloads.map(w => {
+    const n = w.replicas && w.replicas > 0 ? w.replicas : 1;
+    const reps = [];
+    for (let i = 0; i < n; i++) {
+      const rid = w.id + "-" + i;
+      const st = byReplica[rid];
+      reps.push(h("div", { class: "replica" },
+        h("span", { class: "id" }, h("a", { class: "link", onclick: () => showLogs(rid) }, rid)),
+        statusBadge(st),
+        st && st.ip ? h("span", { class: "ip" }, st.ip) : null,
+        h("span", { class: "muted" }, st ? st.node : ""),
+      ));
+    }
+    const res = w.resources ? `${w.resources.cpu_millicores || 0}m / ${w.resources.memory_mb || 0}MB` : "—";
+    return h("tr", {},
+      h("td", {}, w.id),
+      h("td", {}, w.image),
+      h("td", { class: "num" }, String(n)),
+      h("td", {}, res),
+      h("td", {}, reps),
+    );
+  });
+  c.replaceChildren(table(["ID", "Image", "Replicas", "Resources", "Instances"], rows));
+}
+
+function renderServices(services, byReplica, parentOf) {
+  const c = $("services");
+  if (!services.length) { c.replaceChildren(h("div", { class: "empty" }, "no services")); return; }
+  const rows = services.map(s => {
+    let ready = 0;
+    for (const [rid, r] of Object.entries(byReplica)) {
+      if (parentOf[rid] === s.workload_id && r.status === "running" && r.ip) ready++;
+    }
+    return h("tr", {},
+      h("td", {}, s.name),
+      h("td", {}, s.workload_id),
+      h("td", {}, h("span", { class: "ip" }, s.cluster_ip), ":" + s.port),
+      h("td", { class: "num" }, String(s.node_port)),
+      h("td", {}, badge(ready + " ready", ready > 0 ? "ok" : "bad")),
+    );
+  });
+  c.replaceChildren(table(["Name", "Workload", "ClusterIP", "NodePort", "Endpoints"], rows));
+}
+
+async function showLogs(rid) {
+  $("logtitle").textContent = "logs · " + rid;
+  $("logbody").textContent = "loading…";
+  $("logs").classList.add("show");
+  try {
+    const res = await fetch("/workloads/" + encodeURIComponent(rid) + "/logs", { headers: { "Authorization": "Bearer " + token } });
+    if (!res.ok) { $("logbody").textContent = "no logs (" + res.status + ")"; return; }
+    $("logbody").textContent = (await res.text()) || "(empty)";
+  } catch (e) { $("logbody").textContent = "error: " + e.message; }
+}
+
+$("refresh").onclick = refresh;
+$("forget").onclick = () => { token = ""; localStorage.removeItem(TOKEN_KEY); showGate(true); };
+$("logclose").onclick = () => $("logs").classList.remove("show");
+$("tokenSave").onclick = () => {
+  const v = $("tokenInput").value.trim();
+  if (!v) return;
+  token = v; localStorage.setItem(TOKEN_KEY, v); $("tokenInput").value = "";
+  showGate(false); refresh();
+};
+$("tokenInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("tokenSave").click(); });
+
+if (!token) showGate(true); else refresh();
+setInterval(() => { if (token && !$("logs").classList.contains("show")) refresh(); }, 4000);
+</script>
+</body>
+</html>
