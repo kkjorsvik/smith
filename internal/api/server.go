@@ -157,6 +157,8 @@ func (s *Server) Start() {
 	internalMux.HandleFunc("POST /nodes/{id}/heartbeat", s.heartbeat)
 	internalMux.HandleFunc("GET /nodes/{id}/routes", s.nodeRoutes)
 	internalMux.HandleFunc("GET /nodes/{id}/services", s.nodeServices)
+	internalMux.HandleFunc("GET /nodes/{id}/ingresses", s.nodeIngresses)
+	internalMux.HandleFunc("GET /ingress/cert", s.ingressCert)
 
 	// Internal mTLS server for agent communication.
 	internalServer := &http.Server{
@@ -192,47 +194,81 @@ func (s *Server) Start() {
 			log.Fatalf("api: internal server: %v", err)
 		}
 	}()
+
+	// Provision the wildcard cert agents use for ingress TLS (best-effort).
+	go s.ensureWildcardCert()
 }
+
+const (
+	autocertDir      = "/var/lib/smith/autocert"
+	wildcardDomain   = "*.kkjorsvik.com"
+	wildcardZone     = "kkjorsvik.com"
+	wildcardCertFile = autocertDir + "/wildcard.crt"
+	wildcardKeyFile  = autocertDir + "/wildcard.key"
+)
 
 // provisionCert obtains or loads a cached TLS cert for the server's
 // public hostname using ACME DNS-01 via Route 53.
 func (s *Server) provisionCert() (*tls.Config, error) {
 	const domain = "smith-server-01.kkjorsvik.com"
-	certFile := "/var/lib/smith/autocert/server.crt"
-	keyFile := "/var/lib/smith/autocert/server.key"
+	certFile := autocertDir + "/server.crt"
+	keyFile := autocertDir + "/server.key"
 
-	// Use cached cert if it exists.
-	if _, err := os.Stat(certFile); err == nil {
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err == nil {
-			log.Printf("api: loaded cached cert for %s", domain)
-			return &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS13,
-			}, nil
+	if _, err := os.Stat(certFile); err != nil {
+		if err := obtainCert(domain, domain, certFile, keyFile); err != nil {
+			return nil, err
 		}
 	}
 
-	log.Printf("api: provisioning cert for %s via DNS-01", domain)
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load cert for %s: %w", domain, err)
+	}
+	log.Printf("api: serving cert for %s", domain)
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	}, nil
+}
+
+// ensureWildcardCert provisions and caches the wildcard cert used by agents'
+// ingress proxies. Best-effort: a failure just leaves ingress TLS unavailable
+// (agents skip ingress) rather than blocking the control plane.
+func (s *Server) ensureWildcardCert() {
+	if _, err := os.Stat(wildcardCertFile); err == nil {
+		log.Printf("api: wildcard cert cached for %s", wildcardDomain)
+		return
+	}
+	if err := obtainCert(wildcardDomain, wildcardZone, wildcardCertFile, wildcardKeyFile); err != nil {
+		log.Printf("api: provision wildcard cert failed (ingress TLS unavailable): %v", err)
+		return
+	}
+	log.Printf("api: wildcard cert provisioned for %s", wildcardDomain)
+}
+
+// obtainCert runs the ACME DNS-01 (Route 53) flow for orderDomain and caches
+// the resulting cert + key to certFile/keyFile. zoneDomain is the base domain
+// used for the Route 53 hosted-zone lookup (e.g. "kkjorsvik.com"); it differs
+// from orderDomain for a wildcard ("*.kkjorsvik.com").
+func obtainCert(orderDomain, zoneDomain, certFile, keyFile string) error {
+	log.Printf("api: provisioning cert for %s via DNS-01", orderDomain)
 
 	ctx := context.Background()
 
-	// Look up the Route 53 zone ID automatically.
-	zoneID, err := acmedns.GetZoneID(ctx, domain)
+	zoneID, err := acmedns.GetZoneID(ctx, zoneDomain)
 	if err != nil {
-		return nil, fmt.Errorf("get zone ID: %w", err)
+		return fmt.Errorf("get zone ID: %w", err)
 	}
 	log.Printf("api: found Route 53 zone ID: %s", zoneID)
 
 	solver, err := acmedns.NewRoute53Solver(ctx, zoneID)
 	if err != nil {
-		return nil, fmt.Errorf("create solver: %w", err)
+		return fmt.Errorf("create solver: %w", err)
 	}
 
-	// Generate a key for the ACME account.
 	accountKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate account key: %w", err)
+		return fmt.Errorf("generate account key: %w", err)
 	}
 
 	client := &acme.Client{
@@ -240,31 +276,25 @@ func (s *Server) provisionCert() (*tls.Config, error) {
 		DirectoryURL: acme.LetsEncryptURL,
 	}
 
-	// Register with Let's Encrypt.
 	_, err = client.Register(ctx, &acme.Account{}, acme.AcceptTOS)
 	if err != nil && err != acme.ErrAccountAlreadyExists {
-		return nil, fmt.Errorf("register ACME account: %w", err)
+		return fmt.Errorf("register ACME account: %w", err)
 	}
 
-	// Create an order for the domain.
-	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(domain))
+	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(orderDomain))
 	if err != nil {
-		return nil, fmt.Errorf("authorize order: %w", err)
+		return fmt.Errorf("authorize order: %w", err)
 	}
 
-	// Process each authorization in the order.
 	for _, authzURL := range order.AuthzURLs {
 		authz, err := client.GetAuthorization(ctx, authzURL)
 		if err != nil {
-			return nil, fmt.Errorf("get authorization: %w", err)
+			return fmt.Errorf("get authorization: %w", err)
 		}
-
-		// Skip already valid authorizations.
 		if authz.Status == acme.StatusValid {
 			continue
 		}
 
-		// Find the DNS-01 challenge.
 		var chal *acme.Challenge
 		for _, c := range authz.Challenges {
 			if c.Type == "dns-01" {
@@ -273,65 +303,58 @@ func (s *Server) provisionCert() (*tls.Config, error) {
 			}
 		}
 		if chal == nil {
-			return nil, fmt.Errorf("no dns-01 challenge for %s", authz.Identifier.Value)
+			return fmt.Errorf("no dns-01 challenge for %s", authz.Identifier.Value)
 		}
 
-		// Get the TXT record value.
 		keyAuth, err := client.DNS01ChallengeRecord(chal.Token)
 		if err != nil {
-			return nil, fmt.Errorf("dns01 key auth: %w", err)
+			return fmt.Errorf("dns01 key auth: %w", err)
 		}
 
-		// Present the TXT record in Route 53.
 		if err := solver.Present(ctx, chal, authz.Identifier.Value, chal.Token, keyAuth); err != nil {
-			return nil, fmt.Errorf("present challenge: %w", err)
+			return fmt.Errorf("present challenge: %w", err)
 		}
 		defer solver.CleanUp(ctx, chal, authz.Identifier.Value, chal.Token, keyAuth)
 
-		// Tell Let's Encrypt to validate.
 		if _, err := client.Accept(ctx, chal); err != nil {
-			return nil, fmt.Errorf("accept challenge: %w", err)
+			return fmt.Errorf("accept challenge: %w", err)
 		}
 
-		// Wait for this authorization to complete.
 		if _, err := client.WaitAuthorization(ctx, authz.URI); err != nil {
-			return nil, fmt.Errorf("wait authorization for %s: %w", authz.Identifier.Value, err)
+			return fmt.Errorf("wait authorization for %s: %w", authz.Identifier.Value, err)
 		}
 	}
 
-	// Generate the server key and CSR.
 	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate cert key: %w", err)
+		return fmt.Errorf("generate cert key: %w", err)
 	}
 
 	csr, err := x509.CreateCertificateRequest(rand.Reader,
-		&x509.CertificateRequest{DNSNames: []string{domain}},
+		&x509.CertificateRequest{DNSNames: []string{orderDomain}},
 		certKey,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("create CSR: %w", err)
+		return fmt.Errorf("create CSR: %w", err)
 	}
 
-	// Wait for the order to be ready then issue the cert.
 	order, err = client.WaitOrder(ctx, order.URI)
 	if err != nil {
-		return nil, fmt.Errorf("wait order: %w", err)
+		return fmt.Errorf("wait order: %w", err)
 	}
 
 	derChain, _, err := client.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
 	if err != nil {
-		return nil, fmt.Errorf("create order cert: %w", err)
+		return fmt.Errorf("create order cert: %w", err)
 	}
 
-	// Cache the cert and key to disk.
-	if err := os.MkdirAll("/var/lib/smith/autocert", 0700); err != nil {
-		return nil, fmt.Errorf("mkdir autocert: %w", err)
+	if err := os.MkdirAll(autocertDir, 0700); err != nil {
+		return fmt.Errorf("mkdir autocert: %w", err)
 	}
 
 	certOut, err := os.Create(certFile)
 	if err != nil {
-		return nil, fmt.Errorf("create cert file: %w", err)
+		return fmt.Errorf("create cert file: %w", err)
 	}
 	for _, der := range derChain {
 		pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der})
@@ -340,26 +363,17 @@ func (s *Server) provisionCert() (*tls.Config, error) {
 
 	keyDER, err := x509.MarshalECPrivateKey(certKey)
 	if err != nil {
-		return nil, fmt.Errorf("marshal cert key: %w", err)
+		return fmt.Errorf("marshal cert key: %w", err)
 	}
-	keyOut, err := os.Create(keyFile)
+	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return nil, fmt.Errorf("create key file: %w", err)
+		return fmt.Errorf("create key file: %w", err)
 	}
 	pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	keyOut.Close()
 
-	log.Printf("api: cert provisioned and cached for %s", domain)
-
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load provisioned cert: %w", err)
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}, nil
+	log.Printf("api: cert provisioned and cached for %s", orderDomain)
+	return nil
 }
 
 // listWorkloads returns all workloads in the desired state store.
@@ -572,6 +586,67 @@ func (s *Server) computeEndpoints() []types.ServiceEndpoints {
 		})
 	}
 	return out
+}
+
+// nodeIngresses returns the resolved ingress rules (host -> ClusterIP:port) for
+// the agent ingress proxy, joining ingresses with their target services. Served
+// on the internal mTLS mux; the table is identical on every node.
+func (s *Server) nodeIngresses(w http.ResponseWriter, r *http.Request) {
+	rules, err := s.computeIngressRules()
+	if err != nil {
+		httpError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, rules)
+}
+
+// computeIngressRules joins ingresses with their target services, resolving
+// each host to its service's ClusterIP:port. Ingresses whose service does not
+// exist (or has no ClusterIP) are skipped.
+func (s *Server) computeIngressRules() ([]types.IngressRule, error) {
+	if s.ingresses == nil || s.services == nil {
+		return []types.IngressRule{}, nil
+	}
+
+	ings, err := s.ingresses.List()
+	if err != nil {
+		return nil, fmt.Errorf("list ingresses: %w", err)
+	}
+	svcs, err := s.services.List()
+	if err != nil {
+		return nil, fmt.Errorf("list services: %w", err)
+	}
+
+	byName := make(map[string]types.Service, len(svcs))
+	for _, sv := range svcs {
+		byName[sv.Name] = sv
+	}
+
+	rules := make([]types.IngressRule, 0, len(ings))
+	for _, ing := range ings {
+		sv, ok := byName[ing.Service]
+		if !ok || sv.ClusterIP == "" {
+			continue // skip ingresses whose service doesn't exist yet
+		}
+		rules = append(rules, types.IngressRule{Host: ing.Host, ClusterIP: sv.ClusterIP, Port: sv.Port})
+	}
+	return rules, nil
+}
+
+// ingressCert serves the wildcard cert + key for agents' ingress TLS. Served on
+// the internal mTLS mux only (agents are mTLS-authenticated).
+func (s *Server) ingressCert(w http.ResponseWriter, r *http.Request) {
+	certPEM, err := os.ReadFile(wildcardCertFile)
+	if err != nil {
+		httpError(w, fmt.Errorf("wildcard cert not available: %w", err), http.StatusServiceUnavailable)
+		return
+	}
+	keyPEM, err := os.ReadFile(wildcardKeyFile)
+	if err != nil {
+		httpError(w, fmt.Errorf("wildcard key not available: %w", err), http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, http.StatusOK, types.CertBundle{CertPEM: string(certPEM), KeyPEM: string(keyPEM)})
 }
 
 // removeNode decommissions a node: it is removed from the registry, its

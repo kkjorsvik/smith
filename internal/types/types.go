@@ -88,6 +88,13 @@ type IngressRule struct {
 	Port      int    `json:"port"`
 }
 
+// CertBundle is a PEM-encoded certificate and private key, used to ship the
+// wildcard ingress cert from the control plane to agents over mTLS.
+type CertBundle struct {
+	CertPEM string `json:"cert_pem"`
+	KeyPEM  string `json:"key_pem"`
+}
+
 // ServiceEndpoints is what an agent needs to program load-balancing rules:
 // a service plus the current set of backend replica IPs (running only).
 type ServiceEndpoints struct {
