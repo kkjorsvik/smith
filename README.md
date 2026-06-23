@@ -3,9 +3,14 @@
 A small, self-contained container orchestrator. A **control plane**
 (`smith-server`) keeps a desired set of workloads running across a fleet of
 **agent** nodes (`smith-agent`). Each agent owns the container lifecycle locally
-via [containerd](https://containerd.io/); the control plane schedules workloads
-onto nodes, continuously reconciles desired vs. actual state, fails workloads
-over when a node dies, and reports aggregated cluster status.
+via [containerd](https://containerd.io/); the control plane bin-packs replicas
+onto nodes, continuously reconciles desired vs. actual state, rolls out spec
+changes, fails replicas over when a node dies, and reports aggregated status.
+
+It also handles the layers around the container: **cross-node networking**
+(routable container IPs), **services** (ClusterIP/NodePort L4 load balancing),
+**ingress** (host-based HTTPS), and a **web dashboard** — enough to host real
+LAN services end to end.
 
 All control-plane ↔ agent traffic is secured with **mutual TLS** against a
 private CA. The public workload API is served over HTTPS with a Let's Encrypt
@@ -36,17 +41,32 @@ certificate obtained via the ACME **DNS-01** challenge (Route 53).
 
 ## Features
 
-- **Multi-node scheduling** — workloads are placed on the alive node with the
-  fewest assignments (least-loaded).
-- **Reconciliation loop** — the control plane drives actual state toward desired
-  state every 5 seconds: pushing new assignments, stopping removed workloads,
-  and re-pushing anything that isn't actually running.
+- **Resource-aware bin-packing scheduler** — replicas are placed best-fit on
+  nodes with enough free CPU/memory (15% reserved for the system), spread across
+  nodes by anti-affinity. A replica that doesn't fit stays pending.
+- **Multi-replica workloads** — a workload declares `replicas`; the control
+  plane expands it into N instances (`<id>-0`, `<id>-1`, …) and spreads them.
+- **Rolling updates** — changing a workload's spec (image/args/env/ports/
+  resources) rolls replicas in place, rate-limited by `max_unavailable`. Hash of
+  the container-defining fields decides what's stale.
+- **Cross-node container networking** — each node gets a unique `/24` from a
+  cluster CIDR (`10.22.0.0/16`); container IPs are routable cluster-wide via
+  per-node bridges (CNI) + static routes, with selective iptables masquerade.
+- **Services (L4 load balancing)** — a service gets a stable **ClusterIP** and a
+  **NodePort** and load-balances across a workload's running replica IPs via
+  iptables on every node (kube-proxy style).
+- **Ingress (host-based HTTPS)** — map a hostname to a service; every agent runs
+  a TLS-terminating reverse proxy on `:443` that routes by `Host:` using a
+  control-plane-provisioned wildcard cert.
 - **Failover** — when a node misses its heartbeat window it is declared dead and
-  its workloads are rescheduled onto healthy nodes.
-- **Persistent desired state** — workloads are stored in SQLite, so the desired
-  set survives a control-plane restart.
-- **Cluster-wide status** — `GET /status` fans out to every alive agent and
-  returns real per-container state (status + PID) keyed by node.
+  its replicas are rescheduled onto healthy nodes.
+- **Persistent desired state** — workloads, services, ingresses, and per-node
+  subnet allocations live in SQLite, surviving a control-plane restart.
+- **Cluster-wide status & logs** — `GET /status` aggregates real per-replica
+  state (status + PID + IP) from every alive agent; `GET /workloads/{id}/logs`
+  streams a replica's captured stdout/stderr.
+- **Web dashboard** — an embedded UI at `/` shows nodes, workloads/replicas,
+  services, and per-replica logs.
 - **End-to-end TLS** — mutual TLS on the internal plane (private CA); public
   HTTPS via Let's Encrypt DNS-01.
 - **Authenticated public API** — the public `:443` endpoints require a bearer
@@ -94,8 +114,15 @@ Two trust boundaries:
 
 | Binary | Role |
 |--------|------|
-| `smith-server` | Control plane: serves the public + internal APIs, runs the scheduler and reconcile loop, persists desired state. Also provides the `gencerts` subcommand. |
-| `smith-agent` | Worker: registers with the control plane, heartbeats, and serves an mTLS API to receive assignments and report container status. Manages containers via the local containerd. |
+| `smith-server` | Control plane: serves the public + internal APIs, runs the bin-packing scheduler and reconcile loop, allocates per-node subnets / ClusterIPs / NodePorts, provisions certs, and persists desired state. Also provides the `gencerts` and `add-agent` subcommands. |
+| `smith-agent` | Worker: registers (receiving its container subnet), heartbeats, and serves an mTLS API to receive assignments and report replica status/logs. Manages containers via local containerd, programs its CNI bridge + cross-node routes + service load-balancing (iptables), and runs the ingress reverse proxy on `:80`/`:443`. |
+
+Beyond the control loop shown above, each agent also: terminates ingress TLS on
+`:443` (HTTP `:80` redirects to it) and reverse-proxies by host to a service
+ClusterIP; and programs iptables so a service's ClusterIP/NodePort load-balances
+across replica IPs cluster-wide. The control plane distributes the routing
+table, service endpoints, ingress rules, and the wildcard cert to agents over
+the same internal mTLS channel used for register/heartbeat.
 
 ---
 
@@ -103,11 +130,16 @@ Two trust boundaries:
 
 | Component | Port | Protocol | Purpose |
 |-----------|------|----------|---------|
-| smith-server | `:443` | HTTPS (Let's Encrypt) | Public workload API |
-| smith-server | `:9443` | mTLS (Smith CA) | Internal API: node register + heartbeat |
-| smith-agent | `:9000`\* | mTLS (Smith CA) | Receives assign/unassign/status from the control plane |
+| smith-server | `:443` | HTTPS (Let's Encrypt) | Public workload API + web dashboard |
+| smith-server | `:9443` | mTLS (Smith CA) | Internal API: register/heartbeat, route/service/ingress distribution, cert |
+| smith-agent | `:9000`\* | mTLS (Smith CA) | Receives assign/unassign/status/logs from the control plane |
+| smith-agent | `:443` | HTTPS (wildcard cert) | Ingress: TLS termination + host-based reverse proxy |
+| smith-agent | `:80` | HTTP | Ingress: redirect to `:443` |
+| smith-agent | NodePort | TCP/UDP | Per-service NodePorts (`30000–32767`) exposed on every node |
 
-\* Whatever host:port you pass to the agent's `-addr` flag.
+\* Whatever host:port you pass to the agent's `-addr` flag. The ingress
+listeners are best-effort — the agent logs and runs without them if `:80`/`:443`
+can't bind or no wildcard cert is available yet.
 
 ---
 
@@ -212,12 +244,18 @@ on the server). Plan your deployment around them, or change them in source:
 |-------|-------|-------|
 | `/etc/smith/certs/{ca,server}.{crt,key}` | server startup | Internal mTLS material (read on boot) |
 | `/etc/smith/token` | server startup | Public API bearer token (read on boot; server refuses to start if missing/empty) |
-| `/var/lib/smith/state.db` | server | SQLite desired-state store |
-| `/var/lib/smith/autocert/server.{crt,key}` | server | Cached public Let's Encrypt cert |
+| `/var/lib/smith/state.db` | server | SQLite store: workloads, services, ingresses, subnet allocations |
+| `/var/lib/smith/autocert/server.{crt,key}` | server | Cached public Let's Encrypt cert (control-plane domain) |
+| `/var/lib/smith/autocert/wildcard.{crt,key}` | server | Cached `*.kkjorsvik.com` wildcard cert (ingress; shipped to agents) |
 | `smith-server-01.kkjorsvik.com` | server cert + public ACME domain | The public hostname; also the server cert CN |
-| `:443`, `:80`-free, `:9443` | server | Public HTTPS / internal mTLS (no `:80` is used — DNS-01 needs no HTTP listener) |
+| `*.kkjorsvik.com` / `kkjorsvik.com` | wildcard cert domain / Route 53 zone | Ingress wildcard, provisioned via DNS-01 |
+| `10.22.0.0/16` | container network (`BridgeSubnet`) | Cluster pod CIDR, carved into per-node `/24`s |
+| `10.23.0.0/16` | service network (`ServiceCIDR`) | ClusterIP pool |
+| `30000–32767` | NodePort range | Per-service host ports |
+| `:443`, `:80`-free, `:9443` | server | Public HTTPS / internal mTLS (server uses no `:80` — DNS-01 needs no HTTP listener) |
+| `:443`, `:80` | agent | Ingress proxy (TLS) + redirect — must be free on agent hosts |
 | `5s` reconcile interval | server | How often desired/actual state is reconciled |
-| `10s` heartbeat interval | agent | How often an agent pings the control plane |
+| `10s` heartbeat interval | agent | How often an agent pings the control plane (also the route/service/ingress refresh cadence) |
 | `30s` heartbeat timeout | control plane | A node missing this long is declared dead |
 
 ---
@@ -369,6 +407,11 @@ A workload describes a container the cluster should keep running:
   "id": "web",
   "image": "docker.io/library/nginx:latest",
   "args": [],
+  "replicas": 3,
+  "max_unavailable": 1,
+  "env": { "TZ": "UTC" },
+  "ports": [{ "host_port": 8080, "container_port": 80, "protocol": "tcp" }],
+  "resources": { "cpu_millicores": 500, "memory_mb": 256 },
   "health_check": {
     "type": "http",
     "url": "http://localhost:8080/healthz",
@@ -381,10 +424,19 @@ A workload describes a container the cluster should keep running:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | string | Unique workload ID (also the container ID) |
+| `id` | string | Unique workload ID. Replicas get `<id>-0`, `<id>-1`, … container IDs |
 | `image` | string | Fully-qualified image ref (pulled if not present locally) |
 | `args` | string[] | Command arguments |
+| `replicas` | int? | Instances to run, spread across nodes (default 1) |
+| `max_unavailable` | int? | Replicas that may be down at once during a rolling update (default 1) |
+| `env` | map? | Environment variables set in the container |
+| `ports` | object[]? | Host→container port mappings (`host_port`, `container_port`, `protocol`) published via the portmap CNI plugin |
+| `resources` | object? | `cpu_millicores` (1000 = 1 core) and `memory_mb` limits; also used as the scheduler's bin-packing request. `memory_mb` is enforced (OOM-kill) |
 | `health_check` | object? | Optional probe (see below) |
+
+Changing `image`, `args`, `env`, `ports`, or `resources` triggers a **rolling
+update** (replicas recreated in place, at most `max_unavailable` down at once).
+Changing only `replicas` scales out/in without a roll.
 
 `health_check` (optional):
 
@@ -398,6 +450,48 @@ A workload describes a container the cluster should keep running:
 | `threshold` | int | Consecutive failures before marking unhealthy |
 
 Durations are human-readable strings (`"5s"`, `"1m30s"`), not nanoseconds.
+
+### Services
+
+A service is a stable L4 endpoint that load-balances across a workload's running
+replicas. The control plane assigns a **ClusterIP** (from `10.23.0.0/16`) and a
+**NodePort** (`30000–32767`); every agent programs iptables so the ClusterIP is
+reachable cluster-wide and the NodePort is reachable on every node's host IP.
+
+```bash
+curl https://smith-server-01.kkjorsvik.com/services \
+  -H "Authorization: Bearer $(sudo cat /etc/smith/token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"web","workload_id":"web","port":80,"target_port":80}'
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Unique service name (also the DELETE key) |
+| `workload_id` | string | Workload whose replicas back the service |
+| `port` | int | Port clients hit on the ClusterIP |
+| `target_port` | int | Container port traffic is forwarded to |
+| `protocol` | string? | `tcp` (default) or `udp` |
+| `cluster_ip`, `node_port` | — | Assigned by the control plane (response only) |
+
+### Ingress
+
+An ingress maps a hostname to a service for host-based HTTPS. Every agent's
+`:443` proxy terminates TLS with the wildcard cert and reverse-proxies the
+matching `Host:` to the service's ClusterIP. Point LAN DNS for the hostname at a
+live agent (or a floating VIP across them).
+
+```bash
+curl https://smith-server-01.kkjorsvik.com/ingresses \
+  -H "Authorization: Bearer $(sudo cat /etc/smith/token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"host":"git.kkjorsvik.com","service":"forgejo"}'
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `host` | string | FQDN to route (unique key; covered by `*.kkjorsvik.com`) |
+| `service` | string | Target service name |
 
 ---
 
@@ -415,29 +509,43 @@ Authorization: Bearer <token>
 Requests with a missing/malformed header or a non-matching token get
 `401 Unauthorized`. (The token is compared in constant time.)
 
+The dashboard at `GET /` and `GET /ui` is served **unauthenticated** (it's just
+the static shell; it asks for the token in-browser and stores it locally, then
+calls the authenticated endpoints below).
+
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/{$}`, `/ui` | Web dashboard (unauthenticated shell) |
 | `GET` | `/workloads` | List desired workloads |
-| `POST` | `/workloads` | Add a workload (JSON body as above) |
-| `DELETE` | `/workloads/{id}` | Remove a workload (reconciler stops it next tick) |
-| `GET` | `/status` | Cluster-wide container status, aggregated from every alive agent |
+| `POST` | `/workloads` | Add/update a workload (JSON body as above) |
+| `DELETE` | `/workloads/{id}` | Remove a workload (reconciler stops its replicas next tick) |
+| `GET` | `/workloads/{id}/logs` | Stream a replica's captured stdout/stderr (proxied from its agent) |
+| `GET` | `/status` | Cluster-wide replica status, aggregated from every alive agent |
 | `GET` | `/nodes` | Registered nodes and their last heartbeat |
-| `GET` | `/assignments` | Current workload → node assignments |
+| `DELETE` | `/nodes/{id}` | Deregister a node |
+| `GET` | `/assignments` | Current replica → node assignments |
+| `POST` `GET` `DELETE` | `/services`, `/services/{name}` | Manage services (L4 LB) |
+| `POST` `GET` `DELETE` | `/ingresses`, `/ingresses/{host}` | Manage ingresses (host HTTPS) |
 
 ### Internal API — `:9443` (mTLS, used by agents)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/nodes/register` | Agent registration |
+| `POST` | `/nodes/register` | Agent registration; response carries the node's assigned subnet/gateway |
 | `POST` | `/nodes/{id}/heartbeat` | Agent heartbeat |
+| `GET` | `/nodes/{id}/routes` | This node's cross-node container routing table (peer subnet → host IP) |
+| `GET` | `/nodes/{id}/services` | Resolved service endpoints (ClusterIP/NodePort + running replica IPs) |
+| `GET` | `/nodes/{id}/ingresses` | Resolved ingress rules (host → ClusterIP:port) |
+| `GET` | `/ingress/cert` | The wildcard cert + key bundle for ingress TLS |
 
 ### Agent API — agent `-addr` (mTLS, used by the control plane)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/assign` | Start/keep a workload's container |
-| `DELETE` | `/assign/{id}` | Stop a workload's container |
-| `GET` | `/status` | This node's observed container state |
+| `POST` | `/assign` | Start/keep a replica's container |
+| `DELETE` | `/assign/{id}` | Stop a replica's container |
+| `GET` | `/status` | This node's observed container state (status + PID + IP) |
+| `GET` | `/logs/{id}` | This replica's captured logs |
 
 ### Examples
 
@@ -451,58 +559,91 @@ curl https://smith-server-01.kkjorsvik.com/workloads \
 ```
 
 `GET /status` returns observed state aggregated across agents, keyed by node ID,
-then container ID:
+then replica (container) ID:
 
 ```json
 {
   "smith-agent-01": {
-    "web": { "id": "web", "status": "running", "pid": 12345 }
+    "web-0": { "id": "web-0", "status": "running", "pid": 12345, "ip": "10.22.1.7" }
   },
-  "smith-agent-02": {}
+  "smith-agent-02": {
+    "web-1": { "id": "web-1", "status": "running", "pid": 9876, "ip": "10.22.2.4" }
+  }
 }
 ```
 
-A node with no reported containers (or one that was unreachable this cycle)
+A node with no reported replicas (or one that was unreachable this cycle)
 appears with an empty object rather than being omitted. Container `status`
 values come from containerd: `running`, `created`, `stopped`, `paused`,
-`unknown`.
+`unknown`. `ip` is the CNI-assigned container address (empty if networking is
+disabled).
 
 ---
 
 ## How it works
 
 **Registration & heartbeats.** An agent `POST`s to `/nodes/register` on startup,
-then heartbeats every **10s**. The control plane marks a node **dead** if it has
-not heartbeated within **30s** (`HeartbeatTimeout`).
+reporting its CPU count and total memory; the response carries the node's
+assigned container subnet/gateway (allocated from `10.22.0.0/16` and persisted,
+so it's stable across restarts). The agent then heartbeats every **10s** and, on
+the same cadence, pulls its routing table, service endpoints, ingress rules, and
+the wildcard cert. The control plane marks a node **dead** after **30s**
+(`HeartbeatTimeout`).
 
-**Scheduling.** When a workload needs a node, the scheduler picks the **alive
-node with the fewest current assignments**. Assignments are sticky — an already-
-assigned workload keeps its node until that node dies or the workload is removed.
+**Replicas.** Each tick the reconciler **expands** every desired workload into
+`replicas` instances (`<id>-0` … `<id>-N`), and the rest of the loop operates on
+those instances.
+
+**Scheduling (bin-packing).** A replica only lands on a node whose *schedulable*
+capacity (CPU/memory minus a **15%** system reserve) still fits its
+`resources` request. Among fitting nodes the scheduler picks fewest siblings
+first (anti-affinity spread), then **best-fit** (least remaining capacity) as a
+tiebreak. A replica with no fitting node stays **pending** until capacity frees
+up. Placement is sticky — an assigned replica keeps its node until the node dies
+or the replica is removed.
 
 **Reconcile loop (every 5s).** Each tick the control plane:
 
-1. **Evicts dead nodes** — workloads on a dead node are unassigned (and their
-   push records cleared) so they get rescheduled; the node is removed.
-2. **Assigns & pushes** — every desired workload is assigned a node, and the
-   assignment is pushed to that agent over mTLS **only when it is new or the node
-   changed** (not on every tick).
-3. **Verifies running state** — for each pushed workload past a grace period of
-   `2 × interval` (**10s**), it fetches the agent's `/status`; if the container
-   isn't `running`, the push record is cleared so it is re-pushed next tick. The
-   grace period prevents a freshly-started container from being torn down before
-   it reaches `running`.
-4. **Stops removed workloads** — anything assigned but no longer desired is
-   unassigned and the agent is told to stop it.
+1. **Evicts dead nodes** — replicas on a dead node are unassigned (push records
+   cleared) so they reschedule; the node is removed.
+2. **Assigns & pushes** — each desired replica is assigned a node. A push to the
+   agent happens when the replica is **new/moved**, or when its **spec hash is
+   stale** (a rolling update) — and a roll only proceeds if the replica is
+   currently running and the parent's in-flight unavailable count is below
+   `max_unavailable`. Up-to-date replicas are left alone (no push every tick).
+3. **Verifies running state** — for each pushed replica past a `2 × interval`
+   (**10s**) grace period, it checks the agent's `/status`; if the container
+   isn't `running`, the push record is cleared so it re-pushes next tick.
+4. **Stops removed replicas** — anything assigned but no longer desired (a
+   deleted workload, or a scaled-in replica) is unassigned and stopped.
+
+**Spec hash & rolling updates.** `specHash` digests the container-defining
+fields (image/args/env/ports/resources). When it changes, replicas are stale and
+get recreated in place, rate-limited by `max_unavailable`. Changing only
+`replicas` doesn't change the hash, so scaling never triggers a roll.
+
+**Networking.** Each node builds a CNI bridge for its `/24` (host-local IPAM,
+selective masquerade) and installs static routes to every peer's subnet via the
+peer's underlay host IP — so a container on one node reaches a container on
+another by its real IP. The control plane computes each node's routing table
+from the live node set and hands it back via `/nodes/{id}/routes`.
+
+**Services & ingress.** A service's resolved endpoints (ClusterIP, NodePort,
+running replica IPs) are distributed to every agent, which programs iptables
+(kube-proxy style: per-service DNAT chains with random replica selection,
+conntrack pinning, hairpin/NodePort masquerade). Ingress rules (host →
+ClusterIP:port) and the wildcard cert are distributed the same way; each agent's
+`:443` proxy uses them to terminate TLS and route by `Host:`.
 
 **Status aggregation.** `GET /status` calls `Reconciler.AggregateStatus`, which
-fans out to every alive agent's `/status` over mTLS and merges the results by
-node. (The control plane has no local workloads — they all run on agents — so it
-must aggregate rather than read its own containerd.)
+fans out to every alive agent's `/status` over mTLS and merges by node. (The
+control plane runs no workloads — they're all on agents — so it aggregates
+rather than reading its own containerd.)
 
 **Failover, end to end.** Node dies → misses heartbeats → declared dead at 30s →
-its workloads unassigned → rescheduled onto the least-loaded surviving node →
-pushed there → verified running. Desired state is read from SQLite, so this holds
-across a control-plane restart.
+its replicas unassigned → rescheduled (bin-packed) onto surviving nodes → pushed
+→ verified running. Desired state and subnet allocations are in SQLite, so this
+holds across a control-plane restart.
 
 ---
 
@@ -524,6 +665,16 @@ across a control-plane restart.
   from the control plane) and calling out (register/heartbeat). The control
   plane's `server.crt` is likewise used for both its `:9443` listener and its
   outbound calls to agents.
+- **The wildcard key is on every agent.** Ingress TLS terminates on each node,
+  so the control plane ships the `*.kkjorsvik.com` private key to every agent
+  over mTLS. Acceptable for a trusted LAN homelab; for public/production you'd
+  want per-node certs or central termination. Flagged, not solved.
+- **Agents bind `:80`/`:443`.** The ingress proxy needs them free on every agent
+  host. If they're taken (or no wildcard cert exists yet) the agent logs and
+  runs without ingress — scheduling/services are unaffected.
+- **Entry-point HA is external.** smith load-balances across replicas, but
+  getting LAN clients to *a live agent* (a floating VIP via keepalived, or DNS
+  round-robin) is left to you — smith doesn't manage a VIP.
 
 ---
 
@@ -531,20 +682,22 @@ across a control-plane restart.
 
 ```
 cmd/
-  server/        smith-server entrypoint (+ gencerts subcommand)
+  server/        smith-server entrypoint (+ gencerts / add-agent subcommands)
   agent/         smith-agent entrypoint
 internal/
-  acme/          Route 53 DNS-01 ACME solver
-  agent/         agent: register, heartbeat, serve mTLS API, manage containers
-  api/           control-plane HTTP APIs (public :443, internal :9443)
+  acme/          Route 53 DNS-01 ACME solver (control-plane + wildcard certs)
+  agent/         agent: register, heartbeat, manage containers, ingress proxy
+  api/           control-plane HTTP APIs (public :443, internal :9443) + cert provisioning
   health/        health-check Monitor (http/exec probes)
-  reconciler/    reconcile loop, push tracking, status aggregation, SQLite store
   provision/     agent deploy-bundle builder (+ embedded setup.sh / unit)
+  reconciler/    reconcile loop, push tracking, status aggregation; SQLite stores
+                 (workloads, subnets, services, ingresses)
   registry/      node registry + liveness (heartbeat tracking)
-  runtime/       containerd client wrapper
-  scheduler/     least-loaded placement + assignment tracking
+  runtime/       containerd client, CNI bridge, firewall, routes, service LB
+  scheduler/     resource-aware bin-packing placement + assignment tracking
   tls/           ServerConfig / ClientConfig helpers (mTLS, TLS 1.3)
-  types/         shared types (Workload, Node, Assignment, HealthCheck)
+  types/         shared types (Workload, Service, Ingress, Node, Assignment, …)
+  ui/            embedded web dashboard (go:embed)
 scripts/         setup-server.sh + systemd unit (control-plane provisioning)
 docs/specs/      design specs, one per feature
 ```
