@@ -38,6 +38,7 @@ type Server struct {
 	token        string
 	agentClient  *http.Client
 	allocator    *reconciler.SubnetAllocator
+	services     *reconciler.ServiceStore
 }
 
 // New returns a Server with a public API (hardcoded on :443 via autocert)
@@ -63,6 +64,12 @@ func (s *Server) SetStatusFunc(f func() map[string]map[string]runtime.ContainerS
 // container subnets at registration.
 func (s *Server) SetSubnetAllocator(a *reconciler.SubnetAllocator) {
 	s.allocator = a
+}
+
+// SetServiceStore wires in the persistent service store (definitions +
+// ClusterIP/NodePort allocations).
+func (s *Server) SetServiceStore(store *reconciler.ServiceStore) {
+	s.services = store
 }
 
 // SetAgentClient wires in the mTLS HTTP client used to reach agents
@@ -124,6 +131,9 @@ func (s *Server) Start() {
 	publicMux.HandleFunc("GET /assignments", s.requireAuth(s.listAssignments))
 	publicMux.HandleFunc("GET /workloads/{id}/logs", s.requireAuth(s.workloadLogs))
 	publicMux.HandleFunc("DELETE /nodes/{id}", s.requireAuth(s.removeNode))
+	publicMux.HandleFunc("POST /services", s.requireAuth(s.addService))
+	publicMux.HandleFunc("GET /services", s.requireAuth(s.listServices))
+	publicMux.HandleFunc("DELETE /services/{name}", s.requireAuth(s.removeService))
 
 	// Internal mux — node registration, heartbeat, and route distribution
 	// over mTLS.
@@ -514,6 +524,68 @@ func (s *Server) removeNode(w http.ResponseWriter, r *http.Request) {
 
 	evicted := s.scheduler.ReassignNode(id)
 	log.Printf("api: decommissioned node %s, reassigning %d workloads", id, len(evicted))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// addService creates or updates a service, allocating a ClusterIP and
+// NodePort, and returns the stored service with those filled in.
+func (s *Server) addService(w http.ResponseWriter, r *http.Request) {
+	if s.services == nil {
+		httpError(w, fmt.Errorf("service store not configured"), http.StatusInternalServerError)
+		return
+	}
+
+	var svc types.Service
+	if err := json.NewDecoder(r.Body).Decode(&svc); err != nil {
+		httpError(w, fmt.Errorf("decode body: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	stored, err := s.services.Add(svc)
+	if err != nil {
+		httpError(w, fmt.Errorf("add service: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("api: added service %s -> workload %s (ClusterIP %s:%d, NodePort %d)",
+		stored.Name, stored.WorkloadID, stored.ClusterIP, stored.Port, stored.NodePort)
+	writeJSON(w, http.StatusCreated, stored)
+}
+
+// listServices returns all services.
+func (s *Server) listServices(w http.ResponseWriter, r *http.Request) {
+	if s.services == nil {
+		writeJSON(w, http.StatusOK, []types.Service{})
+		return
+	}
+
+	svcs, err := s.services.List()
+	if err != nil {
+		httpError(w, fmt.Errorf("list services: %w", err), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, svcs)
+}
+
+// removeService deletes a service, freeing its ClusterIP and NodePort.
+func (s *Server) removeService(w http.ResponseWriter, r *http.Request) {
+	if s.services == nil {
+		httpError(w, fmt.Errorf("service store not configured"), http.StatusInternalServerError)
+		return
+	}
+
+	name := r.PathValue("name")
+	if name == "" {
+		httpError(w, fmt.Errorf("missing name"), http.StatusBadRequest)
+		return
+	}
+
+	if err := s.services.Remove(name); err != nil {
+		httpError(w, fmt.Errorf("remove service: %w", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("api: removed service %s", name)
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -46,6 +46,27 @@ type Route struct {
 	Via    string `json:"via"`    // e.g. "192.168.1.56"
 }
 
+// Service is a stable virtual endpoint that load-balances across a workload's
+// running replica IPs. It is reachable internally at ClusterIP:Port and
+// externally at <anyNodeIP>:NodePort.
+type Service struct {
+	// Name is the unique service identifier.
+	Name string `json:"name"`
+	// WorkloadID selects the workload whose replicas back this service.
+	WorkloadID string `json:"workload_id"`
+	// Port is the service port clients connect to on the ClusterIP.
+	Port int `json:"port"`
+	// TargetPort is the container port traffic is forwarded to.
+	TargetPort int `json:"target_port"`
+	// Protocol is "tcp" (default) or "udp".
+	Protocol string `json:"protocol,omitempty"`
+	// ClusterIP is the assigned virtual IP (set by the control plane).
+	ClusterIP string `json:"cluster_ip,omitempty"`
+	// NodePort is the assigned host port exposed on every node (set by the
+	// control plane).
+	NodePort int `json:"node_port,omitempty"`
+}
+
 // PortMapping maps a port on the host node to a port inside the container.
 type PortMapping struct {
 	// HostPort is the port exposed on the agent node's host network.

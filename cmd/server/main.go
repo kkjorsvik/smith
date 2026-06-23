@@ -56,6 +56,14 @@ func runServer() {
 	}
 	defer allocator.Close()
 
+	// Service definitions + ClusterIP/NodePort allocations, persisted in the
+	// same state DB.
+	serviceStore, err := reconciler.NewServiceStore("/var/lib/smith/state.db")
+	if err != nil {
+		log.Fatalf("failed to open service store: %v", err)
+	}
+	defer serviceStore.Close()
+
 	// The control plane runs no workloads, so it has no CNI; pass nil.
 	if err := client.CleanupAll(nil); err != nil {
 		log.Fatalf("cleanup failed: %v", err)
@@ -100,6 +108,7 @@ func runServer() {
 	server.SetStatusFunc(r.AggregateStatus)
 	server.SetAgentClient(agentClient)
 	server.SetSubnetAllocator(allocator)
+	server.SetServiceStore(serviceStore)
 
 	if err := server.LoadToken("/etc/smith/token"); err != nil {
 		log.Fatalf("load API token: %v", err)
