@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -246,7 +247,15 @@ func (a *Agent) register() (types.NetworkConfig, error) {
 	return netCfg, nil
 }
 
+// errNodeUnknown means the control plane returned 404 for our heartbeat: it no
+// longer has us in its node registry. The registry is in-memory, so this is the
+// signature of a control-plane restart — the cure is to re-register.
+var errNodeUnknown = errors.New("control plane does not recognize this node")
+
 // heartbeatLoop sends a heartbeat to the control plane every heartbeatInterval.
+// A 404 means the control plane lost our registration (it restarted — the node
+// registry is in-memory), so we re-announce ourselves; the cluster then
+// re-converges within one interval without restarting the agent.
 func (a *Agent) heartbeatLoop() {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
@@ -256,6 +265,9 @@ func (a *Agent) heartbeatLoop() {
 		case <-ticker.C:
 			if err := a.sendHeartbeat(); err != nil {
 				log.Printf("agent: heartbeat failed: %v", err)
+				if errors.Is(err, errNodeUnknown) {
+					a.reRegister()
+				}
 			}
 		case <-a.stop:
 			return
@@ -272,11 +284,32 @@ func (a *Agent) sendHeartbeat() error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("heartbeat: %w", errNodeUnknown)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("heartbeat failed: status %d", resp.StatusCode)
 	}
 
 	return nil
+}
+
+// reRegister re-announces this node after a heartbeat revealed the control
+// plane no longer knows it (typically a control-plane restart). The container
+// subnet is allocated idempotently and persisted server-side, so the node keeps
+// its existing /24 and the already-configured CNI/routes/firewall need no
+// change. A failure here just retries on the next heartbeat tick.
+func (a *Agent) reRegister() {
+	netCfg, err := a.register()
+	if err != nil {
+		log.Printf("agent: re-registration failed: %v (will retry next heartbeat)", err)
+		return
+	}
+	if netCfg.Subnet != "" && a.netCfg.Subnet != "" && netCfg.Subnet != a.netCfg.Subnet {
+		log.Printf("agent: WARNING re-registration returned subnet %s but this node is configured for %s; restart the agent to reconfigure networking", netCfg.Subnet, a.netCfg.Subnet)
+		return
+	}
+	log.Printf("agent: re-registered with control plane after it lost our registration")
 }
 
 // routeSyncLoop periodically pulls this node's cross-node routing table from

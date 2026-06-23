@@ -645,6 +645,14 @@ its replicas unassigned → rescheduled (bin-packed) onto surviving nodes → pu
 → verified running. Desired state and subnet allocations are in SQLite, so this
 holds across a control-plane restart.
 
+**Control-plane restart.** The node registry and assignments are **in-memory**,
+so a restarted control plane comes back not knowing any nodes. Agents' containers
+keep running throughout (the agent owns them locally). When an agent's next
+heartbeat returns `404` (unknown node), it **re-registers** automatically —
+getting its same persisted subnet back — and the control plane re-learns the
+node and re-pushes assignments. So the cluster self-heals within ~one heartbeat
+interval after a server restart, with no agent intervention.
+
 ---
 
 ## Operational notes & caveats
