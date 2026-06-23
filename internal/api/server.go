@@ -141,6 +141,7 @@ func (s *Server) Start() {
 	internalMux.HandleFunc("POST /nodes/register", s.registerNode)
 	internalMux.HandleFunc("POST /nodes/{id}/heartbeat", s.heartbeat)
 	internalMux.HandleFunc("GET /nodes/{id}/routes", s.nodeRoutes)
+	internalMux.HandleFunc("GET /nodes/{id}/services", s.nodeServices)
 
 	// Internal mTLS server for agent communication.
 	internalServer := &http.Server{
@@ -500,6 +501,61 @@ func (s *Server) nodeRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, routes)
+}
+
+// nodeServices returns the load-balancing table for all services: each
+// service's ClusterIP/NodePort plus the IPs of its running replicas. Served on
+// the internal mTLS mux and pulled by agents on their heartbeat cadence. The
+// {id} path value is accepted for symmetry with /routes but unused — the
+// service table is identical on every node.
+func (s *Server) nodeServices(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.computeEndpoints())
+}
+
+// computeEndpoints builds the ServiceEndpoints list by intersecting service
+// definitions with the current replica assignments and observed status: a
+// service's endpoints are the IPs of its workload's running replicas.
+func (s *Server) computeEndpoints() []types.ServiceEndpoints {
+	if s.services == nil {
+		return []types.ServiceEndpoints{}
+	}
+	svcs, err := s.services.List()
+	if err != nil {
+		log.Printf("api: compute endpoints: list services: %v", err)
+		return []types.ServiceEndpoints{}
+	}
+
+	// nodeID -> replicaID -> status (IP, running). Empty if no status func.
+	var status map[string]map[string]runtime.ContainerStatus
+	if s.statusFunc != nil {
+		status = s.statusFunc()
+	}
+
+	// parent workload -> its replica assignments.
+	byParent := make(map[string][]types.Assignment)
+	for _, a := range s.scheduler.ListAssignments() {
+		byParent[a.ParentID] = append(byParent[a.ParentID], a)
+	}
+
+	out := make([]types.ServiceEndpoints, 0, len(svcs))
+	for _, svc := range svcs {
+		eps := make([]string, 0)
+		for _, a := range byParent[svc.WorkloadID] {
+			cs, ok := status[a.NodeID][a.WorkloadID]
+			if ok && cs.Status == "running" && cs.IP != "" {
+				eps = append(eps, cs.IP)
+			}
+		}
+		out = append(out, types.ServiceEndpoints{
+			ClusterIP:  svc.ClusterIP,
+			Port:       svc.Port,
+			NodePort:   svc.NodePort,
+			TargetPort: svc.TargetPort,
+			Protocol:   svc.Protocol,
+			Endpoints:  eps,
+		})
+	}
+	return out
 }
 
 // removeNode decommissions a node: it is removed from the registry, its

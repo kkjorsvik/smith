@@ -67,6 +67,17 @@ type Service struct {
 	NodePort int `json:"node_port,omitempty"`
 }
 
+// ServiceEndpoints is what an agent needs to program load-balancing rules:
+// a service plus the current set of backend replica IPs (running only).
+type ServiceEndpoints struct {
+	ClusterIP  string   `json:"cluster_ip"`
+	Port       int      `json:"port"`
+	NodePort   int      `json:"node_port"`
+	TargetPort int      `json:"target_port"`
+	Protocol   string   `json:"protocol"`
+	Endpoints  []string `json:"endpoints"`
+}
+
 // PortMapping maps a port on the host node to a port inside the container.
 type PortMapping struct {
 	// HostPort is the port exposed on the agent node's host network.
