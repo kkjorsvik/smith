@@ -142,6 +142,15 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("cleanup: %w", err)
 	}
 
+	// Remove any stale bridge so CNI setup isn't blocked by a leftover smith0
+	// whose IP doesn't match this run's assigned subnet. Containers are gone
+	// after CleanupAll, so the bridge has no attached veths.
+	if a.cni != nil {
+		if err := smithruntime.RemoveBridge(); err != nil {
+			log.Printf("agent: remove stale bridge: %v", err)
+		}
+	}
+
 	go a.heartbeatLoop()
 	go a.serveHTTP(a.serverTLS)
 	go a.routeSyncLoop()

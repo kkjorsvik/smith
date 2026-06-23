@@ -3,12 +3,14 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 
 	gocni "github.com/containerd/go-cni"
 	"github.com/kkjorsvik/smith/internal/types"
+	"github.com/vishvananda/netlink"
 )
 
 // BridgeSubnet is the cluster-wide CIDR pool the control plane carves into
@@ -49,6 +51,28 @@ func NewCNI() (*CNI, error) {
 	}
 
 	return &CNI{cni: c}, nil
+}
+
+// RemoveBridge deletes the smith CNI bridge if it exists. A bridge is a kernel
+// object that outlives the agent process, and the bridge plugin refuses to
+// start if the existing bridge IP differs from the desired gateway (e.g. a
+// leftover from a previous subnet assignment or prefix length). Removing it on
+// startup lets the plugin recreate it cleanly on the next container setup.
+// Safe to call after CleanupAll, when no containers (and thus no veths) remain.
+func RemoveBridge() error {
+	link, err := netlink.LinkByName(bridgeName)
+	if err != nil {
+		var notFound netlink.LinkNotFoundError
+		if errors.As(err, &notFound) {
+			return nil
+		}
+		return fmt.Errorf("look up bridge %s: %w", bridgeName, err)
+	}
+	if err := netlink.LinkDel(link); err != nil {
+		return fmt.Errorf("delete bridge %s: %w", bridgeName, err)
+	}
+	log.Printf("cni: removed stale bridge %s", bridgeName)
+	return nil
 }
 
 // NewCNIForSubnet initializes CNI from an in-process bridge config generated
@@ -150,10 +174,22 @@ func (c *CNI) Setup(ctx context.Context, id, netnsPath string, ports []types.Por
 		return "", fmt.Errorf("cni setup for %s: %w", id, err)
 	}
 
-	// Extract the container IP from the result.
+	// Extract the container IP from the result. result.Interfaces is a map
+	// (random iteration order) and includes the loopback network, so skip
+	// the "lo" interface and any loopback/non-IPv4 address to land on the
+	// bridge interface's real address (e.g. 10.22.1.7).
 	var ip string
-	for _, iface := range result.Interfaces {
+	for name, iface := range result.Interfaces {
+		if name == "lo" {
+			continue
+		}
 		for _, ipconf := range iface.IPConfigs {
+			if ipconf.IP.IsLoopback() {
+				continue
+			}
+			if ipconf.IP.To4() == nil {
+				continue
+			}
 			ip = ipconf.IP.String()
 			break
 		}
