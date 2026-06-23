@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -42,7 +43,8 @@ func main() {
 	}
 
 	// Resolve the underlay host IP used as the route target by peer nodes.
-	// Defaults to the host portion of -addr.
+	// Defaults to the host portion of -addr. Peers install routes via this
+	// value with netlink, so it must be an IP — resolve a hostname if needed.
 	resolvedHostIP := *hostIP
 	if resolvedHostIP == "" {
 		host, _, err := net.SplitHostPort(*addr)
@@ -50,6 +52,10 @@ func main() {
 			log.Fatalf("agent: cannot derive -hostip from -addr %q: %v (pass -hostip)", *addr, err)
 		}
 		resolvedHostIP = host
+	}
+	resolvedHostIP, err := resolveHostIP(resolvedHostIP)
+	if err != nil {
+		log.Fatalf("agent: %v (pass -hostip with an explicit IP)", err)
 	}
 
 	// For outbound calls to the control plane.
@@ -86,4 +92,23 @@ func main() {
 
 	log.Println("agent: shutting down...")
 	a.Stop()
+}
+
+// resolveHostIP returns s unchanged if it is already an IP, otherwise it
+// resolves the hostname to its first IPv4 address. Peers route container
+// traffic via this value, so it must be an IP.
+func resolveHostIP(s string) (string, error) {
+	if net.ParseIP(s) != nil {
+		return s, nil
+	}
+	addrs, err := net.LookupHost(s)
+	if err != nil {
+		return "", fmt.Errorf("resolve host IP %q: %w", s, err)
+	}
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+			return a, nil
+		}
+	}
+	return "", fmt.Errorf("no IPv4 address found for %q", s)
 }

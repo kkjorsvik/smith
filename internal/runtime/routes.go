@@ -9,10 +9,16 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// nodeSubnetBits is the prefix length of a per-node block (/24). Only routes
+// with exactly this prefix are considered smith-managed, so aggregate routes
+// like the cluster /16 are never touched.
+const nodeSubnetBits = 24
+
 // RouteManager installs and reconciles the static routes that make other
 // nodes' container subnets reachable from this node. It only ever touches
-// routes whose destination is inside the cluster CIDR and is not this node's
-// own subnet — host, default, and unrelated routes are never modified.
+// gateway'd /24 routes inside the cluster CIDR that are not this node's own
+// subnet — host, default, connected, aggregate, and unrelated routes are
+// never modified.
 type RouteManager struct {
 	cluster   *net.IPNet // the cluster pool, e.g. 10.22.0.0/16
 	ownSubnet string     // this node's /24 in CIDR string form
@@ -85,13 +91,21 @@ func (rm *RouteManager) Sync(routes []types.Route) error {
 	return nil
 }
 
-// managed reports whether a route is one smith owns: destination inside the
-// cluster pool and not this node's own (bridge-connected) subnet.
+// managed reports whether a route is one smith owns and may delete: a
+// gateway'd /24 inside the cluster pool that is not this node's own subnet.
+// Requiring a gateway excludes the bridge's own connected route and any
+// on-link aggregate; requiring /24 excludes the cluster /16 itself.
 func (rm *RouteManager) managed(route netlink.Route) bool {
 	if route.Dst == nil {
 		return false
 	}
+	if route.Gw == nil {
+		return false
+	}
 	if !rm.cluster.Contains(route.Dst.IP) {
+		return false
+	}
+	if ones, _ := route.Dst.Mask.Size(); ones != nodeSubnetBits {
 		return false
 	}
 	return route.Dst.String() != rm.ownSubnet
