@@ -228,7 +228,7 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	defer func() {
 		if taskCleanup {
 			if _, err := task.Delete(ctx, containerd.WithProcessKill); err != nil {
-				if !errdefs.IsNotFound(err) {
+				if !benignDeleteErr(err) {
 					log.Printf("warn: task cleanup %s: %v", opts.ID, err)
 				}
 			}
@@ -301,7 +301,7 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	// Delete the task AFTER receiving exit status — deferring this
 	// races with exit status collection and can swallow signal codes.
 	if _, err := task.Delete(ctx); err != nil {
-		if !errdefs.IsNotFound(err) {
+		if !benignDeleteErr(err) {
 			log.Printf("warn: task delete %s: %v", opts.ID, err)
 		}
 	}
@@ -390,7 +390,7 @@ func (c *Client) StopContainer(id string, cni *CNI, ports []types.PortMapping) e
 			}
 		}
 
-		if _, err := task.Delete(ctx); err != nil {
+		if _, err := task.Delete(ctx); err != nil && !benignDeleteErr(err) {
 			log.Printf("warn: task delete %s: %v", id, err)
 		}
 	}
@@ -409,6 +409,15 @@ func (c *Client) StopContainer(id string, cni *CNI, ports []types.PortMapping) e
 
 	log.Printf("stopped and cleaned up container %s", id)
 	return nil
+}
+
+// benignDeleteErr reports whether a task-delete error is an expected outcome
+// of the concurrent teardown race (StopContainer vs RunContainer's exit path):
+// the task is already gone (NotFound) or its process already reaped
+// (FailedPrecondition: "cannot delete a deleted process"). These are normal
+// and should not be logged as warnings.
+func benignDeleteErr(err error) bool {
+	return errdefs.IsNotFound(err) || errdefs.IsFailedPrecondition(err)
 }
 
 // ErrAlreadyExists returns true if the error indicates a resource

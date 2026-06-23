@@ -224,6 +224,8 @@ func (c *CNI) Teardown(ctx context.Context, id, netnsPath string, ports []types.
 		return fmt.Errorf("cni remove for %s: %w", id, err)
 	}
 
-	log.Printf("cni: container %s networking torn down", id)
+	// Teardown success is silent: it can run twice for one container when
+	// StopContainer and RunContainer's exit path both clean up, and the
+	// container-stop path already logs the result.
 	return nil
 }
