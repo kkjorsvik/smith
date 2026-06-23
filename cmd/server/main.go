@@ -48,6 +48,14 @@ func runServer() {
 	}
 	defer store.Close()
 
+	// Per-node container subnet allocator, persisted in the same state DB.
+	// The cluster CIDR is carved into per-node /24 blocks.
+	allocator, err := reconciler.NewSubnetAllocator("/var/lib/smith/state.db", runtime.BridgeSubnet)
+	if err != nil {
+		log.Fatalf("failed to open subnet allocator: %v", err)
+	}
+	defer allocator.Close()
+
 	// The control plane runs no workloads, so it has no CNI; pass nil.
 	if err := client.CleanupAll(nil); err != nil {
 		log.Fatalf("cleanup failed: %v", err)
@@ -91,6 +99,7 @@ func runServer() {
 	server := api.New(store, client, reg, sched, ":9443", serverTLS)
 	server.SetStatusFunc(r.AggregateStatus)
 	server.SetAgentClient(agentClient)
+	server.SetSubnetAllocator(allocator)
 
 	if err := server.LoadToken("/etc/smith/token"); err != nil {
 		log.Fatalf("load API token: %v", err)

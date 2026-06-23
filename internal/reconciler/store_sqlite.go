@@ -14,7 +14,10 @@ type SQLiteStore struct {
 }
 
 func NewSQLiteStore(path string) (*SQLiteStore, error) {
-	db, err := sql.Open("sqlite3", path)
+	// busy_timeout lets writes wait out a lock held by the subnet allocator,
+	// which shares this database file, instead of failing with "database is
+	// locked".
+	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open db %s: %w", path, err)
 	}

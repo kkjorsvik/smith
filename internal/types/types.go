@@ -26,6 +26,16 @@ type Resources struct {
 	MemoryMB int `json:"memory_mb,omitempty"`
 }
 
+// NetworkConfig is the per-node container network assignment the control
+// plane returns to an agent at registration. The agent builds its CNI bridge
+// from this so container IPs are unique and routable across the cluster.
+type NetworkConfig struct {
+	// Subnet is this node's container CIDR, e.g. "10.22.3.0/24".
+	Subnet string `json:"subnet"`
+	// Gateway is the bridge IP on this node, e.g. "10.22.3.1".
+	Gateway string `json:"gateway"`
+}
+
 // PortMapping maps a port on the host node to a port inside the container.
 type PortMapping struct {
 	// HostPort is the port exposed on the agent node's host network.

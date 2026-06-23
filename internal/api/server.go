@@ -37,6 +37,7 @@ type Server struct {
 	statusFunc   func() map[string]map[string]runtime.ContainerStatus
 	token        string
 	agentClient  *http.Client
+	allocator    *reconciler.SubnetAllocator
 }
 
 // New returns a Server with a public API (hardcoded on :443 via autocert)
@@ -56,6 +57,12 @@ func New(store reconciler.Storer, client *runtime.Client, reg *registry.Registry
 // container status (provided by the reconciler).
 func (s *Server) SetStatusFunc(f func() map[string]map[string]runtime.ContainerStatus) {
 	s.statusFunc = f
+}
+
+// SetSubnetAllocator wires in the per-node subnet allocator used to assign
+// container subnets at registration.
+func (s *Server) SetSubnetAllocator(a *reconciler.SubnetAllocator) {
+	s.allocator = a
 }
 
 // SetAgentClient wires in the mTLS HTTP client used to reach agents
@@ -396,8 +403,23 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.registry.Register(node)
-	log.Printf("api: node registered: %s at %s", node.ID, node.Addr)
-	w.WriteHeader(http.StatusOK)
+
+	// Without an allocator wired (e.g. tests), preserve the legacy empty-200
+	// response. Normal server startup always wires one.
+	if s.allocator == nil {
+		log.Printf("api: node registered: %s at %s (no subnet allocator)", node.ID, node.Addr)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	netCfg, err := s.allocator.Allocate(node.ID)
+	if err != nil {
+		httpError(w, fmt.Errorf("allocate subnet for %s: %w", node.ID, err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("api: node registered: %s at %s, subnet %s", node.ID, node.Addr, netCfg.Subnet)
+	writeJSON(w, http.StatusOK, netCfg)
 }
 
 // heartbeat handles agent heartbeat requests.
