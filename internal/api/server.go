@@ -40,6 +40,7 @@ type Server struct {
 	agentClient  *http.Client
 	allocator    *reconciler.SubnetAllocator
 	services     *reconciler.ServiceStore
+	ingresses    *reconciler.IngressStore
 }
 
 // New returns a Server with a public API (hardcoded on :443 via autocert)
@@ -71,6 +72,11 @@ func (s *Server) SetSubnetAllocator(a *reconciler.SubnetAllocator) {
 // ClusterIP/NodePort allocations).
 func (s *Server) SetServiceStore(store *reconciler.ServiceStore) {
 	s.services = store
+}
+
+// SetIngressStore wires in the persistent ingress store (host -> service).
+func (s *Server) SetIngressStore(store *reconciler.IngressStore) {
+	s.ingresses = store
 }
 
 // SetAgentClient wires in the mTLS HTTP client used to reach agents
@@ -140,6 +146,9 @@ func (s *Server) Start() {
 	publicMux.HandleFunc("POST /services", s.requireAuth(s.addService))
 	publicMux.HandleFunc("GET /services", s.requireAuth(s.listServices))
 	publicMux.HandleFunc("DELETE /services/{name}", s.requireAuth(s.removeService))
+	publicMux.HandleFunc("POST /ingresses", s.requireAuth(s.addIngress))
+	publicMux.HandleFunc("GET /ingresses", s.requireAuth(s.listIngresses))
+	publicMux.HandleFunc("DELETE /ingresses/{host}", s.requireAuth(s.removeIngress))
 
 	// Internal mux — node registration, heartbeat, and route distribution
 	// over mTLS.
@@ -649,6 +658,65 @@ func (s *Server) removeService(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("api: removed service %s", name)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// addIngress creates or updates a host -> service ingress mapping.
+func (s *Server) addIngress(w http.ResponseWriter, r *http.Request) {
+	if s.ingresses == nil {
+		httpError(w, fmt.Errorf("ingress store not configured"), http.StatusInternalServerError)
+		return
+	}
+
+	var ing types.Ingress
+	if err := json.NewDecoder(r.Body).Decode(&ing); err != nil {
+		httpError(w, fmt.Errorf("decode body: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	if err := s.ingresses.Add(ing); err != nil {
+		httpError(w, fmt.Errorf("add ingress: %w", err), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("api: added ingress %s -> service %s", ing.Host, ing.Service)
+	writeJSON(w, http.StatusCreated, ing)
+}
+
+// listIngresses returns all ingresses.
+func (s *Server) listIngresses(w http.ResponseWriter, r *http.Request) {
+	if s.ingresses == nil {
+		writeJSON(w, http.StatusOK, []types.Ingress{})
+		return
+	}
+
+	ings, err := s.ingresses.List()
+	if err != nil {
+		httpError(w, fmt.Errorf("list ingresses: %w", err), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, ings)
+}
+
+// removeIngress deletes an ingress by host.
+func (s *Server) removeIngress(w http.ResponseWriter, r *http.Request) {
+	if s.ingresses == nil {
+		httpError(w, fmt.Errorf("ingress store not configured"), http.StatusInternalServerError)
+		return
+	}
+
+	host := r.PathValue("host")
+	if host == "" {
+		httpError(w, fmt.Errorf("missing host"), http.StatusBadRequest)
+		return
+	}
+
+	if err := s.ingresses.Remove(host); err != nil {
+		httpError(w, fmt.Errorf("remove ingress: %w", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("api: removed ingress %s", host)
 	w.WriteHeader(http.StatusNoContent)
 }
 

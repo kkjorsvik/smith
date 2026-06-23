@@ -64,6 +64,13 @@ func runServer() {
 	}
 	defer serviceStore.Close()
 
+	// Ingress definitions (host -> service), persisted in the same state DB.
+	ingressStore, err := reconciler.NewIngressStore("/var/lib/smith/state.db")
+	if err != nil {
+		log.Fatalf("failed to open ingress store: %v", err)
+	}
+	defer ingressStore.Close()
+
 	// The control plane runs no workloads, so it has no CNI; pass nil.
 	if err := client.CleanupAll(nil); err != nil {
 		log.Fatalf("cleanup failed: %v", err)
@@ -109,6 +116,7 @@ func runServer() {
 	server.SetAgentClient(agentClient)
 	server.SetSubnetAllocator(allocator)
 	server.SetServiceStore(serviceStore)
+	server.SetIngressStore(ingressStore)
 
 	if err := server.LoadToken("/etc/smith/token"); err != nil {
 		log.Fatalf("load API token: %v", err)

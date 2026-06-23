@@ -70,6 +70,24 @@ type Service struct {
 	NodePort int `json:"node_port,omitempty"`
 }
 
+// Ingress maps a hostname to a service for host-based HTTPS routing. The
+// agent ingress proxy terminates TLS and reverse-proxies requests for Host to
+// the target service's ClusterIP.
+type Ingress struct {
+	// Host is the FQDN to route, e.g. "git.kkjorsvik.com" (unique key).
+	Host string `json:"host"`
+	// Service is the target service's name.
+	Service string `json:"service"`
+}
+
+// IngressRule is a resolved ingress the agent proxy programs: route Host to
+// ClusterIP:Port (the target service's stable address).
+type IngressRule struct {
+	Host      string `json:"host"`
+	ClusterIP string `json:"cluster_ip"`
+	Port      int    `json:"port"`
+}
+
 // ServiceEndpoints is what an agent needs to program load-balancing rules:
 // a service plus the current set of backend replica IPs (running only).
 type ServiceEndpoints struct {
