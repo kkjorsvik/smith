@@ -406,14 +406,17 @@ a rolling update; run it on the control-plane box with your agent hosts:
 ./scripts/update.sh smith-agent-01.kkjorsvik.com smith-agent-02.kkjorsvik.com
 ```
 
-It builds both binaries from the current checkout (`git pull` first if you want
-newer code), updates + restarts the control plane, waits for the agents to
-re-register, then rolls each agent **one at a time** — pushing the new binary,
-restarting `smith-agent`, and waiting for the node to re-register and its
-replicas to return to running before moving to the next. Each agent's containers
-cycle briefly as it restarts, so spread a workload's `replicas` across nodes (and
-front it with a service) to stay up during the roll. Requires `jq` and ssh
-access to the agents.
+It records each node's current replica count, builds both binaries from the
+current checkout (`git pull` first if you want newer code), updates + restarts
+the control plane, then rolls each agent **one at a time** — pushing the new
+binary, restarting `smith-agent`, and waiting for the node to re-register (which
+happens at agent startup) and its replicas to return to running before moving to
+the next. It does **not** wait for the running agents to self-heal the
+control-plane restart first — the per-agent restart re-registers each node
+regardless, so this also works when the agents are still on an older binary.
+Each agent's containers cycle briefly as it restarts, so spread a workload's
+`replicas` across nodes (and front it with a service) to stay up during the roll.
+Requires `jq` and ssh access to the agents.
 
 ---
 

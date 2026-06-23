@@ -51,38 +51,53 @@ poll() {
   done
 }
 
+# Record baselines BEFORE any disruption, while the old agents are still
+# registered, so the per-agent recovery check compares against real counts.
+# Best-effort: a node not currently registered reads as 0.
+declare -A BEFORE
+echo "==> Recording current replica counts"
+for h in "${AGENTS[@]}"; do
+  nid="$(node_id "$h")"
+  BEFORE[$nid]="$(running_count "$nid")"
+  echo "    ${nid}: ${BEFORE[$nid]} running"
+done
+
 echo "==> Building binaries in ${REPO_DIR}"
 ( cd "$REPO_DIR" && go build -o bin/smith-server ./cmd/server && go build -o bin/smith-agent ./cmd/agent )
 
 echo "==> Updating control plane"
 sudo install -m0755 "${REPO_DIR}/bin/smith-server" /usr/local/bin/smith-server
 sudo systemctl restart smith-server
-poll "control plane API" 60 api /nodes >/dev/null
+if ! poll "control plane API" 60 api /nodes >/dev/null; then
+  echo "  control plane did not come back — check journalctl -u smith-server" >&2
+  exit 1
+fi
 echo "    control plane back up"
 
-echo "==> Waiting for agents to re-register with the restarted control plane"
-for h in "${AGENTS[@]}"; do
-  poll "$(node_id "$h") to re-register" 60 node_present "$(node_id "$h")"
-done
-
+# We do NOT wait for the running agents to re-register here: they may be on an
+# older binary that can't self-heal a 404. Each agent is restarted below, which
+# re-registers it at startup regardless — the roll itself brings every node back.
 for h in "${AGENTS[@]}"; do
   nid="$(node_id "$h")"
-  before="$(running_count "$nid")"
-  echo "==> Rolling ${nid} (${h}) — ${before} running replicas before restart"
+  echo "==> Rolling ${nid} (${h}) — ${BEFORE[$nid]} running replicas before update"
 
   scp -q "${REPO_DIR}/bin/smith-agent" "${h}:~/smith-agent.new"
   ssh "$h" 'sudo install -m0755 ~/smith-agent.new /usr/local/bin/smith-agent && sudo systemctl restart smith-agent && rm -f ~/smith-agent.new'
 
-  # Re-registration is required before rolling the next agent — bail if a node
-  # doesn't come back, rather than draining more capacity.
-  poll "${nid} to re-register" 60 node_present "$nid"
+  # Re-registration happens at agent startup, so this should always succeed.
+  # If it doesn't, bail rather than draining more capacity by rolling the next.
+  if ! poll "${nid} to re-register" 90 node_present "$nid"; then
+    echo "  ${nid} did not re-register after restart — aborting before rolling more agents" >&2
+    echo "  check: journalctl -u smith-agent on ${h}" >&2
+    exit 1
+  fi
 
   # Replica recovery is best-effort: a quick restart keeps assignments sticky to
   # this node, but a slow one (>30s dead threshold) may move them elsewhere.
-  if poll "${nid} replicas to return to running (>= ${before})" 180 replicas_restored "$nid" "$before"; then
+  if poll "${nid} replicas to return to running (>= ${BEFORE[$nid]})" 180 replicas_restored "$nid" "${BEFORE[$nid]}"; then
     echo "    ${nid} healthy"
   else
-    echo "    WARNING: ${nid} did not return to ${before} running replicas — check journalctl -u smith-agent on ${h}" >&2
+    echo "    WARNING: ${nid} did not return to ${BEFORE[$nid]} running replicas — check journalctl -u smith-agent on ${h}" >&2
   fi
 done
 
