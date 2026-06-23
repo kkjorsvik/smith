@@ -17,6 +17,9 @@ type Workload struct {
 	// Replicas is how many instances of this workload to run, spread across
 	// nodes. 0 or omitted means 1.
 	Replicas int `json:"replicas,omitempty"`
+	// MaxUnavailable is how many replicas may be down at once during a rolling
+	// update. 0 or omitted means 1.
+	MaxUnavailable int `json:"max_unavailable,omitempty"`
 }
 
 // Resources defines CPU and memory limits for a workload.

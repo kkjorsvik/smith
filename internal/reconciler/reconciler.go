@@ -2,11 +2,14 @@ package reconciler
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -31,11 +34,11 @@ type Storer interface {
 // to that node's agent over HTTP, and evicts workloads from dead nodes. The
 // agents own container lifecycle locally; the control plane only schedules.
 type Reconciler struct {
-	client    *runtime.Client
-	store     Storer
-	monitor   *health.Monitor
-	registry  *registry.Registry
-	scheduler *scheduler.Scheduler
+	client     *runtime.Client
+	store      Storer
+	monitor    *health.Monitor
+	registry   *registry.Registry
+	scheduler  *scheduler.Scheduler
 	interval   time.Duration
 	stop       chan struct{}
 	pushed     map[string]pushRecord // workloadID -> last successful push
@@ -43,10 +46,11 @@ type Reconciler struct {
 	httpClient *http.Client
 }
 
-// pushRecord tracks where and when a workload was last successfully pushed.
+// pushRecord tracks where, when, and with what spec a replica was last pushed.
 type pushRecord struct {
 	nodeID   string
 	pushedAt time.Time
+	specHash string
 }
 
 // New returns a Reconciler that reconciles every interval. tlsCfg is used
@@ -123,8 +127,25 @@ func (r *Reconciler) reconcile() error {
 		r.registry.Remove(node.ID)
 	}
 
-	// Ensure every desired replica is assigned and running on a node.
+	// Snapshot which replicas are currently Running across the cluster, used
+	// both for rollout pacing and the repush-if-not-running check below.
+	running := r.clusterRunning()
+
+	// Per-workload count of replicas that are not Running (down or starting).
+	// A rolling update must not push this above the workload's MaxUnavailable.
+	unavailable := make(map[string]int)
 	for _, inst := range desired {
+		if !running[inst.wl.ID] {
+			unavailable[inst.parent]++
+		}
+	}
+
+	// Ensure every desired replica is assigned and on its node with the
+	// current spec. Process in stable replica order so rollouts are
+	// deterministic.
+	for _, id := range sortedReplicaIDs(desired) {
+		inst := desired[id]
+
 		assignment, err := r.scheduler.Assign(inst.wl.ID, inst.parent)
 		if err != nil {
 			log.Printf("reconciler: assign %s: %v", inst.wl.ID, err)
@@ -138,50 +159,60 @@ func (r *Reconciler) reconcile() error {
 			continue
 		}
 
+		desiredHash := specHash(inst.wl)
+
 		r.mu.Lock()
-		rec, exists := r.pushed[inst.wl.ID]
-		alreadyPushed := exists && rec.nodeID == assignment.NodeID
+		rec, pushedExists := r.pushed[inst.wl.ID]
 		r.mu.Unlock()
 
-		if !alreadyPushed {
+		switch {
+		case !pushedExists || rec.nodeID != assignment.NodeID:
+			// Initial placement, or the replica moved to a new node.
 			if err := r.pushAssignment(node, inst.wl); err != nil {
 				log.Printf("reconciler: push assignment %s to %s: %v", inst.wl.ID, node.ID, err)
 				continue
 			}
-			r.mu.Lock()
-			r.pushed[inst.wl.ID] = pushRecord{nodeID: assignment.NodeID, pushedAt: time.Now()}
-			r.mu.Unlock()
+			r.recordPush(inst.wl.ID, assignment.NodeID, desiredHash)
 			log.Printf("reconciler: pushed %s to %s", inst.wl.ID, node.ID)
+
+		case rec.specHash != desiredHash:
+			// Stale spec — roll it, but only a Running replica and only while
+			// the workload stays within its MaxUnavailable budget. Replacing
+			// it makes it temporarily unavailable, so account for that.
+			if running[inst.wl.ID] && unavailable[inst.parent] < maxUnavailable(stored[inst.parent]) {
+				if err := r.pushUnassign(node, inst.wl.ID); err != nil {
+					log.Printf("reconciler: roll unassign %s on %s: %v", inst.wl.ID, node.ID, err)
+					continue
+				}
+				if err := r.pushAssignment(node, inst.wl); err != nil {
+					log.Printf("reconciler: roll assign %s to %s: %v", inst.wl.ID, node.ID, err)
+					continue
+				}
+				r.recordPush(inst.wl.ID, assignment.NodeID, desiredHash)
+				unavailable[inst.parent]++
+				log.Printf("reconciler: rolled %s on %s to new spec", inst.wl.ID, node.ID)
+			}
+
+		default:
+			// Up to date — nothing to do.
 		}
 	}
 
-	// Check that pushed workloads are actually running on their assigned nodes.
+	// Repush replicas that are no longer Running (past a grace period so a
+	// freshly-pushed container has time to start). The next reconcile places
+	// them again with the current desired spec.
 	gracePeriod := 2 * r.interval
-	for workloadID, rec := range r.pushed {
-		// Give the container time to start before checking.
+	r.mu.Lock()
+	for replicaID, rec := range r.pushed {
 		if time.Since(rec.pushedAt) < gracePeriod {
 			continue
 		}
-
-		node, exists := r.registry.Get(rec.nodeID)
-		if !exists {
-			continue
-		}
-
-		agentStatus, err := r.fetchAgentStatus(node)
-		if err != nil {
-			log.Printf("reconciler: fetch status from %s: %v", node.ID, err)
-			continue
-		}
-
-		status, running := agentStatus[workloadID]
-		if !running || status.Status != containerd.Running {
-			log.Printf("reconciler: %s not running on %s, will repush", workloadID, rec.nodeID)
-			r.mu.Lock()
-			delete(r.pushed, workloadID)
-			r.mu.Unlock()
+		if !running[replicaID] {
+			log.Printf("reconciler: %s not running on %s, will repush", replicaID, rec.nodeID)
+			delete(r.pushed, replicaID)
 		}
 	}
+	r.mu.Unlock()
 
 	// Stop containers on nodes for workloads no longer in desired state.
 	for _, assignment := range r.scheduler.ListAssignments() {
@@ -223,6 +254,69 @@ func expand(desired map[string]types.Workload) map[string]replicaInstance {
 			rw.ID = fmt.Sprintf("%s-%d", id, i)
 			rw.Replicas = 0 // a replica instance is a single container
 			out[rw.ID] = replicaInstance{wl: rw, parent: id}
+		}
+	}
+	return out
+}
+
+// sortedReplicaIDs returns the desired replica IDs in stable (sorted) order so
+// rollouts replace replicas deterministically.
+func sortedReplicaIDs(desired map[string]replicaInstance) []string {
+	ids := make([]string, 0, len(desired))
+	for id := range desired {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// maxUnavailable returns the workload's rolling-update budget, defaulting to 1.
+func maxUnavailable(w types.Workload) int {
+	if w.MaxUnavailable < 1 {
+		return 1
+	}
+	return w.MaxUnavailable
+}
+
+// specHash is a stable digest of the container-defining fields of a workload.
+// It deliberately excludes Replicas and MaxUnavailable, so scaling and changing
+// the rollout budget do not trigger a rolling update.
+func specHash(w types.Workload) string {
+	canonical := struct {
+		Image     string              `json:"image"`
+		Args      []string            `json:"args"`
+		Env       map[string]string   `json:"env"`
+		Ports     []types.PortMapping `json:"ports"`
+		Resources *types.Resources    `json:"resources"`
+	}{w.Image, w.Args, w.Env, w.Ports, w.Resources}
+
+	// encoding/json sorts map keys, so Env ordering is stable.
+	b, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// recordPush stores the push record for a replica under the lock.
+func (r *Reconciler) recordPush(replicaID, nodeID, specHash string) {
+	r.mu.Lock()
+	r.pushed[replicaID] = pushRecord{nodeID: nodeID, pushedAt: time.Now(), specHash: specHash}
+	r.mu.Unlock()
+}
+
+// clusterRunning returns a map of replica ID -> whether it is Running, built
+// from a single status fetch per alive node.
+func (r *Reconciler) clusterRunning() map[string]bool {
+	out := make(map[string]bool)
+	for _, node := range r.registry.Alive() {
+		status, err := r.fetchAgentStatus(node)
+		if err != nil {
+			log.Printf("reconciler: fetch status from %s: %v", node.ID, err)
+			continue
+		}
+		for id, cs := range status {
+			if cs.Status == containerd.Running {
+				out[id] = true
+			}
 		}
 	}
 	return out
