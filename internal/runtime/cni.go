@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -10,9 +11,19 @@ import (
 	"github.com/kkjorsvik/smith/internal/types"
 )
 
-// BridgeSubnet is the CIDR the smith CNI bridge allocates container IPs
-// from. The firewall and CNI config must agree on this value.
+// BridgeSubnet is the cluster-wide CIDR pool the control plane carves into
+// per-node /24 blocks. It is the firewall's forwarding/masquerade scope and
+// must match the SubnetAllocator's pool.
 const BridgeSubnet = "10.22.0.0/16"
+
+const (
+	// bridgeName is the Linux bridge smith creates on each node.
+	bridgeName = "smith0"
+	// cniVersion must be supported by the CNI plugins installed in
+	// /opt/cni/bin. 1.0.0 is supported by containernetworking/plugins v1.x;
+	// drop to "0.4.0" if older plugins reject it.
+	cniVersion = "1.0.0"
+)
 
 // CNI wraps the go-cni library configured for smith's network.
 type CNI struct {
@@ -38,6 +49,69 @@ func NewCNI() (*CNI, error) {
 	}
 
 	return &CNI{cni: c}, nil
+}
+
+// NewCNIForSubnet initializes CNI from an in-process bridge config generated
+// for this node's assigned subnet, rather than a static /etc/cni/net.d file.
+// This is how each node gets a unique, cluster-routable container subnet.
+func NewCNIForSubnet(subnet, gateway string) (*CNI, error) {
+	confList, err := renderBridgeConflist(subnet, gateway)
+	if err != nil {
+		return nil, fmt.Errorf("render bridge conflist: %w", err)
+	}
+
+	c, err := gocni.New(
+		gocni.WithMinNetworkCount(2),
+		gocni.WithPluginConfDir("/etc/cni/net.d"),
+		gocni.WithPluginDir([]string{"/opt/cni/bin"}),
+		gocni.WithInterfacePrefix("eth"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create cni: %w", err)
+	}
+
+	if err := c.Load(gocni.WithLoNetwork, gocni.WithConfListBytes(confList)); err != nil {
+		return nil, fmt.Errorf("load cni config: %w", err)
+	}
+
+	log.Printf("cni: bridge %s configured for subnet %s (gateway %s)", bridgeName, subnet, gateway)
+	return &CNI{cni: c}, nil
+}
+
+// renderBridgeConflist builds a bridge + host-local + portmap CNI conflist
+// for the given node subnet. ipMasq is false: masquerading is handled
+// selectively by the firewall (egress only) so inter-node container traffic
+// keeps its real source IP.
+func renderBridgeConflist(subnet, gateway string) ([]byte, error) {
+	conflist := map[string]any{
+		"cniVersion": cniVersion,
+		"name":       "smith",
+		"plugins": []any{
+			map[string]any{
+				"type":        "bridge",
+				"bridge":      bridgeName,
+				"isGateway":   true,
+				"ipMasq":      false,
+				"hairpinMode": true,
+				"ipam": map[string]any{
+					"type": "host-local",
+					"ranges": []any{
+						[]any{
+							map[string]any{"subnet": subnet, "gateway": gateway},
+						},
+					},
+					"routes": []any{
+						map[string]any{"dst": "0.0.0.0/0"},
+					},
+				},
+			},
+			map[string]any{
+				"type":         "portmap",
+				"capabilities": map[string]any{"portMappings": true},
+			},
+		},
+	}
+	return json.Marshal(conflist)
 }
 
 // portMappings converts smith port mappings into go-cni port mappings,

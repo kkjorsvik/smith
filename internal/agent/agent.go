@@ -34,6 +34,7 @@ type Agent struct {
 	serverTLS  *tls.Config
 	cni        *smithruntime.CNI
 	firewall   *smithruntime.Firewall
+	netCfg     types.NetworkConfig // assigned at registration
 	mu         sync.Mutex
 	ports      map[string][]types.PortMapping // workloadID -> ports
 }
@@ -52,17 +53,10 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 		},
 	}
 
-	// CNI is best-effort: if it can't initialize (no config in
-	// /etc/cni/net.d, missing plugins), the agent still runs and serves
-	// workloads without port mappings.
-	cni, err := smithruntime.NewCNI()
-	if err != nil {
-		log.Printf("agent: CNI init failed, port mapping disabled: %v", err)
-		cni = nil
-	}
-
-	// Firewall is best-effort, like CNI: if iptables is unavailable the
-	// agent still runs, but the operator must manage FORWARD/INPUT rules.
+	// Firewall is best-effort: if iptables is unavailable the agent still
+	// runs, but the operator must manage FORWARD/INPUT/nat rules. CNI is
+	// initialized later in Start(), once registration assigns this node's
+	// subnet to build the bridge from.
 	fw, err := smithruntime.NewFirewall(smithruntime.BridgeSubnet)
 	if err != nil {
 		log.Printf("agent: firewall init failed, port management disabled: %v", err)
@@ -77,7 +71,6 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 		stop:       make(chan struct{}),
 		httpClient: httpClient,
 		serverTLS:  serverTLS,
-		cni:        cni,
 		firewall:   fw,
 		ports:      make(map[string][]types.PortMapping),
 	}
@@ -86,22 +79,55 @@ func New(id, addr, serverAddr string, client *smithruntime.Client, clientTLS, se
 // Start registers with the control plane, starts the heartbeat loop,
 // and starts the agent's HTTP server in goroutines.
 func (a *Agent) Start() error {
-	// Clear ghost containers left by a previous unclean shutdown, releasing
-	// their CNI IP allocations. Runs after agent.New initialized a.cni and
-	// before registration so stale host-local IPAM entries don't cause
-	// "duplicate allocation" failures when workloads are re-assigned.
-	if err := a.client.CleanupAll(a.cni); err != nil {
-		return fmt.Errorf("cleanup: %w", err)
-	}
-
-	if err := a.register(); err != nil {
+	// Register first (retrying until the control plane is reachable):
+	// registration assigns this node's container subnet, which the CNI
+	// bridge is built from. A control-plane restart must not wedge agents,
+	// so we retry with backoff rather than failing.
+	netCfg, err := a.registerWithRetry()
+	if err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
+	a.netCfg = netCfg
 
+	// Build the CNI bridge from the assigned subnet. If the control plane
+	// returned no subnet (older server), fall back to the static
+	// /etc/cni/net.d config so the agent still functions.
+	if netCfg.Subnet != "" {
+		cni, err := smithruntime.NewCNIForSubnet(netCfg.Subnet, netCfg.Gateway)
+		if err != nil {
+			log.Printf("agent: CNI init for subnet %s failed, port mapping disabled: %v", netCfg.Subnet, err)
+			cni = nil
+		}
+		a.cni = cni
+	} else {
+		log.Printf("agent: control plane assigned no subnet; falling back to static CNI config")
+		cni, err := smithruntime.NewCNI()
+		if err != nil {
+			log.Printf("agent: static CNI init failed, port mapping disabled: %v", err)
+			cni = nil
+		}
+		a.cni = cni
+	}
+
+	// Host network setup: forwarding rules, egress-only masquerade, and IP
+	// forwarding so cross-node container traffic is routed.
 	if a.firewall != nil {
 		if err := a.firewall.EnsureForwarding(); err != nil {
 			log.Printf("agent: ensure forwarding: %v", err)
 		}
+		if err := a.firewall.EnsureMasquerade(smithruntime.BridgeSubnet); err != nil {
+			log.Printf("agent: ensure masquerade: %v", err)
+		}
+	}
+	if err := smithruntime.EnableIPForwarding(); err != nil {
+		log.Printf("agent: enable ip_forward: %v", err)
+	}
+
+	// Clear ghost containers left by a previous unclean shutdown, releasing
+	// their CNI IP allocations, before serving assignments. Uses the
+	// subnet-derived CNI built above.
+	if err := a.client.CleanupAll(a.cni); err != nil {
+		return fmt.Errorf("cleanup: %w", err)
 	}
 
 	go a.heartbeatLoop()
@@ -115,35 +141,69 @@ func (a *Agent) Stop() {
 	close(a.stop)
 }
 
-// register sends a registration request to the control plane.
-func (a *Agent) register() error {
-	hostname, _ := os.Hostname()
+// registerWithRetry calls register, retrying with exponential backoff until
+// it succeeds or the agent is stopped. Registration assigns this node's
+// subnet, so a transient control-plane outage at boot must not permanently
+// wedge the agent.
+func (a *Agent) registerWithRetry() (types.NetworkConfig, error) {
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	for attempt := 1; ; attempt++ {
+		netCfg, err := a.register()
+		if err == nil {
+			return netCfg, nil
+		}
+
+		log.Printf("agent: registration attempt %d failed: %v; retrying in %s", attempt, err, backoff)
+		select {
+		case <-time.After(backoff):
+		case <-a.stop:
+			return types.NetworkConfig{}, fmt.Errorf("registration cancelled during shutdown")
+		}
+
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+// register sends a registration request to the control plane and returns the
+// network config (subnet/gateway) the control plane assigned this node.
+func (a *Agent) register() (types.NetworkConfig, error) {
 	node := types.Node{
 		ID:       a.id,
 		Addr:     a.addr,
 		CPU:      getCPUCount(),
 		MemoryMB: getMemoryMB(),
 	}
-	_ = hostname
 
 	body, err := json.Marshal(node)
 	if err != nil {
-		return fmt.Errorf("marshal node: %w", err)
+		return types.NetworkConfig{}, fmt.Errorf("marshal node: %w", err)
 	}
 
 	url := fmt.Sprintf("https://%s/nodes/register", a.serverAddr)
 	resp, err := a.httpClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("post register: %w", err)
+		return types.NetworkConfig{}, fmt.Errorf("post register: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("register failed: status %d", resp.StatusCode)
+		return types.NetworkConfig{}, fmt.Errorf("register failed: status %d", resp.StatusCode)
 	}
 
-	log.Printf("agent: registered with control plane at %s", a.serverAddr)
-	return nil
+	// Decode the assigned network config. Tolerate an empty body from an
+	// older control plane that doesn't allocate subnets yet.
+	var netCfg types.NetworkConfig
+	if err := json.NewDecoder(resp.Body).Decode(&netCfg); err != nil && err != io.EOF {
+		return types.NetworkConfig{}, fmt.Errorf("decode network config: %w", err)
+	}
+
+	log.Printf("agent: registered with control plane at %s (subnet %q)", a.serverAddr, netCfg.Subnet)
+	return netCfg, nil
 }
 
 // heartbeatLoop sends a heartbeat to the control plane every heartbeatInterval.

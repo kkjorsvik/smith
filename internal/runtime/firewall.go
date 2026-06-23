@@ -3,6 +3,7 @@ package runtime
 import (
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/kkjorsvik/smith/internal/types"
@@ -44,6 +45,32 @@ func (f *Firewall) EnsureForwarding() error {
 	}
 
 	log.Printf("firewall: forwarding enabled for %s", f.subnet)
+	return nil
+}
+
+// EnsureMasquerade adds a nat POSTROUTING rule that masquerades container
+// traffic leaving the cluster (egress to the internet) while NOT touching
+// inter-node container traffic (destination still inside the cluster CIDR),
+// so cross-node packets keep their real container source IP. The bridge is
+// configured with ipMasq:false precisely so this is the only masquerade rule.
+// Idempotent.
+func (f *Firewall) EnsureMasquerade(clusterCIDR string) error {
+	if err := f.ensureRule("nat", "POSTROUTING",
+		"-s", clusterCIDR, "!", "-d", clusterCIDR, "-j", "MASQUERADE"); err != nil {
+		return fmt.Errorf("masquerade for %s: %w", clusterCIDR, err)
+	}
+	log.Printf("firewall: egress masquerade enabled for %s", clusterCIDR)
+	return nil
+}
+
+// EnableIPForwarding turns on IPv4 forwarding so the host routes traffic
+// between container subnets and on to other nodes. Without it, inter-node
+// container traffic is dropped. Best-effort; callers log failures.
+func EnableIPForwarding() error {
+	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644); err != nil {
+		return fmt.Errorf("enable ip_forward: %w", err)
+	}
+	log.Printf("firewall: net.ipv4.ip_forward enabled")
 	return nil
 }
 
