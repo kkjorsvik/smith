@@ -12,7 +12,10 @@
 # stay up as long as a workload's replicas are spread across nodes.
 #
 # Builds from the current checkout — `git pull` first if you want newer code.
-# Uses sudo for local privileged steps and ssh (as you) + remote sudo on agents.
+# Run it as your normal user (it sudo's the privileged local steps); running it
+# under sudo also works. Either way ssh/scp use your keys. Requires that your
+# user can sudo non-interactively (NOPASSWD) on the agents, since the remote
+# binary swap runs `sudo` over a non-interactive ssh.
 set -euo pipefail
 
 SERVER_HOST="${SMITH_SERVER_HOST:-smith-server-01.kkjorsvik.com}"
@@ -27,8 +30,25 @@ AGENTS=("$@")
 
 command -v jq >/dev/null || { echo "update: jq is required" >&2; exit 1; }
 
-TOKEN="$(sudo cat /etc/smith/token)"
-api()       { curl -fsS -H "Authorization: Bearer ${TOKEN}" "https://${SERVER_HOST}$1"; }
+# Work whether started as your user (sudo'ing the privileged steps) or under
+# sudo. Local privileged steps run as root; ssh/scp always run as the invoking
+# user so they use *your* keys — root on this box has none for the agents.
+if [[ $EUID -eq 0 ]]; then
+  RUN_USER="${SUDO_USER:-root}"
+  if [[ "$RUN_USER" == "root" ]]; then
+    echo "update: run as your normal user (with sudo access), not as root —" >&2
+    echo "        ssh to the agents needs your SSH keys, which root lacks." >&2
+    exit 1
+  fi
+  asroot() { "$@"; }
+  asuser() { sudo -u "$RUN_USER" -H "$@"; }
+else
+  asroot() { sudo "$@"; }
+  asuser() { "$@"; }
+fi
+
+TOKEN="$(asroot cat /etc/smith/token)"
+api() { curl -fsS -H "Authorization: Bearer ${TOKEN}" "https://${SERVER_HOST}$1" 2>/dev/null; }
 node_id()   { echo "${1%%.*}"; }   # smith-agent-01.kkjorsvik.com -> smith-agent-01
 
 # count of running containers the cluster reports on a node
@@ -66,8 +86,8 @@ echo "==> Building binaries in ${REPO_DIR}"
 ( cd "$REPO_DIR" && go build -o bin/smith-server ./cmd/server && go build -o bin/smith-agent ./cmd/agent )
 
 echo "==> Updating control plane"
-sudo install -m0755 "${REPO_DIR}/bin/smith-server" /usr/local/bin/smith-server
-sudo systemctl restart smith-server
+asroot install -m0755 "${REPO_DIR}/bin/smith-server" /usr/local/bin/smith-server
+asroot systemctl restart smith-server
 if ! poll "control plane API" 60 api /nodes >/dev/null; then
   echo "  control plane did not come back — check journalctl -u smith-server" >&2
   exit 1
@@ -81,8 +101,8 @@ for h in "${AGENTS[@]}"; do
   nid="$(node_id "$h")"
   echo "==> Rolling ${nid} (${h}) — ${BEFORE[$nid]} running replicas before update"
 
-  scp -q "${REPO_DIR}/bin/smith-agent" "${h}:~/smith-agent.new"
-  ssh "$h" 'sudo install -m0755 ~/smith-agent.new /usr/local/bin/smith-agent && sudo systemctl restart smith-agent && rm -f ~/smith-agent.new'
+  asuser scp -q "${REPO_DIR}/bin/smith-agent" "${h}:~/smith-agent.new"
+  asuser ssh "$h" 'sudo install -m0755 ~/smith-agent.new /usr/local/bin/smith-agent && sudo systemctl restart smith-agent && rm -f ~/smith-agent.new'
 
   # Re-registration happens at agent startup, so this should always succeed.
   # If it doesn't, bail rather than draining more capacity by rolling the next.
