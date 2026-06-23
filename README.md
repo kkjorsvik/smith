@@ -396,6 +396,25 @@ place, and starts `smith-agent.service`. The node then pulls its subnet, routes,
 services, ingress rules, and the wildcard cert from the control plane on its own
 — no further per-node configuration.
 
+### Updating a running cluster
+
+For a **code update** (new binaries, certs unchanged), don't re-bundle — just
+replace the binaries and restart the services. `scripts/update.sh` does this as
+a rolling update; run it on the control-plane box with your agent hosts:
+
+```bash
+./scripts/update.sh smith-agent-01.kkjorsvik.com smith-agent-02.kkjorsvik.com
+```
+
+It builds both binaries from the current checkout (`git pull` first if you want
+newer code), updates + restarts the control plane, waits for the agents to
+re-register, then rolls each agent **one at a time** — pushing the new binary,
+restarting `smith-agent`, and waiting for the node to re-register and its
+replicas to return to running before moving to the next. Each agent's containers
+cycle briefly as it restarts, so spread a workload's `replicas` across nodes (and
+front it with a service) to stay up during the roll. Requires `jq` and ssh
+access to the agents.
+
 ---
 
 ## Workloads
@@ -706,7 +725,7 @@ internal/
   tls/           ServerConfig / ClientConfig helpers (mTLS, TLS 1.3)
   types/         shared types (Workload, Service, Ingress, Node, Assignment, …)
   ui/            embedded web dashboard (go:embed)
-scripts/         setup-server.sh + systemd unit (control-plane provisioning)
+scripts/         setup-server.sh + systemd unit (provisioning); update.sh (rolling update)
 docs/specs/      design specs, one per feature
 ```
 
