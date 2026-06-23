@@ -146,7 +146,7 @@ func (r *Reconciler) reconcile() error {
 	for _, id := range sortedReplicaIDs(desired) {
 		inst := desired[id]
 
-		assignment, err := r.scheduler.Assign(inst.wl.ID, inst.parent)
+		assignment, err := r.scheduler.Assign(inst.wl.ID, inst.parent, requestOf(inst.wl))
 		if err != nil {
 			log.Printf("reconciler: assign %s: %v", inst.wl.ID, err)
 			continue
@@ -268,6 +268,15 @@ func sortedReplicaIDs(desired map[string]replicaInstance) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// requestOf returns a workload's resource request for scheduling (its limits;
+// the zero value when it declares no Resources).
+func requestOf(w types.Workload) types.Resources {
+	if w.Resources == nil {
+		return types.Resources{}
+	}
+	return *w.Resources
 }
 
 // maxUnavailable returns the workload's rolling-update budget, defaulting to 1.

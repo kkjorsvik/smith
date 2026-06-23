@@ -18,11 +18,11 @@ func newSchedulerWithNodes(ids ...string) *Scheduler {
 func TestAssignSpreadsReplicas(t *testing.T) {
 	s := newSchedulerWithNodes("n1", "n2")
 
-	a0, err := s.Assign("w-0", "w")
+	a0, err := s.Assign("w-0", "w", types.Resources{})
 	if err != nil {
 		t.Fatalf("assign w-0: %v", err)
 	}
-	a1, err := s.Assign("w-1", "w")
+	a1, err := s.Assign("w-1", "w", types.Resources{})
 	if err != nil {
 		t.Fatalf("assign w-1: %v", err)
 	}
@@ -33,7 +33,7 @@ func TestAssignSpreadsReplicas(t *testing.T) {
 	}
 
 	// A third replica stacks (2 nodes, 3 replicas) → 2+1, never 3+0.
-	a2, err := s.Assign("w-2", "w")
+	a2, err := s.Assign("w-2", "w", types.Resources{})
 	if err != nil {
 		t.Fatalf("assign w-2: %v", err)
 	}
@@ -54,11 +54,11 @@ func TestAssignSpreadsReplicas(t *testing.T) {
 func TestAssignSticky(t *testing.T) {
 	s := newSchedulerWithNodes("n1", "n2")
 
-	first, err := s.Assign("w-0", "w")
+	first, err := s.Assign("w-0", "w", types.Resources{})
 	if err != nil {
 		t.Fatalf("assign: %v", err)
 	}
-	again, err := s.Assign("w-0", "w")
+	again, err := s.Assign("w-0", "w", types.Resources{})
 	if err != nil {
 		t.Fatalf("re-assign: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestAssignSticky(t *testing.T) {
 
 func TestAssignNoNodes(t *testing.T) {
 	s := newSchedulerWithNodes()
-	if _, err := s.Assign("w-0", "w"); err == nil {
+	if _, err := s.Assign("w-0", "w", types.Resources{}); err == nil {
 		t.Fatal("expected error with no alive nodes, got nil")
 	}
 }
@@ -81,8 +81,8 @@ func TestReassignNodeFailover(t *testing.T) {
 	s := newSchedulerWithNodes("n1", "n2")
 
 	// Place two replicas (one per node).
-	a0, _ := s.Assign("w-0", "w")
-	s.Assign("w-1", "w")
+	a0, _ := s.Assign("w-0", "w", types.Resources{})
+	s.Assign("w-1", "w", types.Resources{})
 
 	// Evict the node hosting w-0; it should be reassigned to the survivor.
 	evicted := s.ReassignNode(a0.NodeID)
@@ -93,7 +93,7 @@ func TestReassignNodeFailover(t *testing.T) {
 	// Re-place: only the other node is "alive" in the registry sense here,
 	// but both are still registered, so it just needs to land somewhere and
 	// be sticky afterward.
-	re, err := s.Assign("w-0", "w")
+	re, err := s.Assign("w-0", "w", types.Resources{})
 	if err != nil {
 		t.Fatalf("reassign after eviction: %v", err)
 	}

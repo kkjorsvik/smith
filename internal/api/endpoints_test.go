@@ -28,9 +28,9 @@ func TestComputeEndpoints(t *testing.T) {
 	reg.Register(types.Node{ID: "n2", Addr: "n2:9000"})
 	sched := scheduler.New(reg)
 
-	a0, _ := sched.Assign("nginx-0", "nginx")
-	a1, _ := sched.Assign("nginx-1", "nginx")
-	a2, _ := sched.Assign("nginx-2", "nginx")
+	a0, _ := sched.Assign("nginx-0", "nginx", types.Resources{})
+	a1, _ := sched.Assign("nginx-1", "nginx", types.Resources{})
+	a2, _ := sched.Assign("nginx-2", "nginx", types.Resources{})
 
 	// nginx-0 and nginx-1 are running with IPs; nginx-2 is not running (must
 	// be excluded). Keyed by the nodes the scheduler actually chose.
