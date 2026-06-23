@@ -547,6 +547,7 @@ func (s *Server) computeEndpoints() []types.ServiceEndpoints {
 			}
 		}
 		out = append(out, types.ServiceEndpoints{
+			Name:       svc.Name,
 			ClusterIP:  svc.ClusterIP,
 			Port:       svc.Port,
 			NodePort:   svc.NodePort,

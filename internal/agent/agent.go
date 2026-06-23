@@ -36,6 +36,7 @@ type Agent struct {
 	cni        *smithruntime.CNI
 	firewall   *smithruntime.Firewall
 	routeMgr   *smithruntime.RouteManager
+	svcProxy   *smithruntime.ServiceProxy
 	netCfg     types.NetworkConfig // assigned at registration
 	mu         sync.Mutex
 	ports      map[string][]types.PortMapping // workloadID -> ports
@@ -111,6 +112,14 @@ func (a *Agent) Start() error {
 		} else {
 			a.routeMgr = rm
 		}
+
+		// Service proxy programs load-balancing rules for services.
+		sp, err := smithruntime.NewServiceProxy(smithruntime.BridgeSubnet)
+		if err != nil {
+			log.Printf("agent: service proxy init failed, services disabled: %v", err)
+		} else {
+			a.svcProxy = sp
+		}
 	} else {
 		log.Printf("agent: control plane assigned no subnet; falling back to static CNI config")
 		cni, err := smithruntime.NewCNI()
@@ -154,6 +163,7 @@ func (a *Agent) Start() error {
 	go a.heartbeatLoop()
 	go a.serveHTTP(a.serverTLS)
 	go a.routeSyncLoop()
+	go a.serviceSyncLoop()
 
 	return nil
 }
@@ -314,6 +324,60 @@ func (a *Agent) fetchRoutes() ([]types.Route, error) {
 		return nil, fmt.Errorf("decode routes: %w", err)
 	}
 	return routes, nil
+}
+
+// serviceSyncLoop periodically pulls the service load-balancing table from the
+// control plane and reconciles iptables rules, so new/changed services and
+// replica churn take effect within one interval.
+func (a *Agent) serviceSyncLoop() {
+	if a.svcProxy == nil {
+		return
+	}
+
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	a.syncServices() // sync once immediately on start
+	for {
+		select {
+		case <-ticker.C:
+			a.syncServices()
+		case <-a.stop:
+			return
+		}
+	}
+}
+
+// syncServices fetches and applies the service table once.
+func (a *Agent) syncServices() {
+	services, err := a.fetchServices()
+	if err != nil {
+		log.Printf("agent: fetch services: %v", err)
+		return
+	}
+	if err := a.svcProxy.Sync(services); err != nil {
+		log.Printf("agent: sync services: %v", err)
+	}
+}
+
+// fetchServices pulls the service load-balancing table from the control plane.
+func (a *Agent) fetchServices() ([]types.ServiceEndpoints, error) {
+	url := fmt.Sprintf("https://%s/nodes/%s/services", a.serverAddr, a.id)
+	resp, err := a.httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("get services: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("services failed: status %d", resp.StatusCode)
+	}
+
+	var services []types.ServiceEndpoints
+	if err := json.NewDecoder(resp.Body).Decode(&services); err != nil {
+		return nil, fmt.Errorf("decode services: %w", err)
+	}
+	return services, nil
 }
 
 // serveHTTP starts the agent's HTTP server so the control plane can

@@ -70,6 +70,7 @@ type Service struct {
 // ServiceEndpoints is what an agent needs to program load-balancing rules:
 // a service plus the current set of backend replica IPs (running only).
 type ServiceEndpoints struct {
+	Name       string   `json:"name"`
 	ClusterIP  string   `json:"cluster_ip"`
 	Port       int      `json:"port"`
 	NodePort   int      `json:"node_port"`
