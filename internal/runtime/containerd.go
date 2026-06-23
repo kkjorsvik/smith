@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,6 +36,9 @@ func LogPath(id string) string {
 // Client wraps the containerd client with smith-specific defaults.
 type Client struct {
 	inner *containerd.Client
+
+	mu  sync.Mutex
+	ips map[string]string // containerID -> CNI-assigned IP
 }
 
 // NewClient opens a connection to containerd and returns a Client.
@@ -44,7 +48,31 @@ func NewClient() (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to containerd at %s: %w", SocketPath, err)
 	}
-	return &Client{inner: c}, nil
+	return &Client{inner: c, ips: make(map[string]string)}, nil
+}
+
+// setIP records the CNI-assigned IP for a container.
+func (c *Client) setIP(id, ip string) {
+	if ip == "" {
+		return
+	}
+	c.mu.Lock()
+	c.ips[id] = ip
+	c.mu.Unlock()
+}
+
+// clearIP forgets a container's IP. Called wherever the container is removed.
+func (c *Client) clearIP(id string) {
+	c.mu.Lock()
+	delete(c.ips, id)
+	c.mu.Unlock()
+}
+
+// getIP returns the recorded IP for a container, or "" if none is known.
+func (c *Client) getIP(id string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ips[id]
 }
 
 // Close releases the containerd connection.
@@ -171,6 +199,7 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	started := false
 	defer func() {
 		if !started {
+			c.clearIP(opts.ID)
 			if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
 				if !errdefs.IsNotFound(err) {
 					log.Printf("warn: container cleanup %s: %v", opts.ID, err)
@@ -212,9 +241,11 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	var netnsPath string
 	if opts.CNI != nil {
 		netnsPath = fmt.Sprintf("/proc/%d/ns/net", task.Pid())
-		if _, err := opts.CNI.Setup(ctx, opts.ID, netnsPath, opts.Ports); err != nil {
+		ip, err := opts.CNI.Setup(ctx, opts.ID, netnsPath, opts.Ports)
+		if err != nil {
 			return 0, fmt.Errorf("cni setup for %s: %w", opts.ID, err)
 		}
+		c.setIP(opts.ID, ip)
 	}
 
 	// Tear down CNI on any early error return after setup succeeded. Runs
@@ -276,6 +307,7 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 	}
 	taskCleanup = false
 
+	c.clearIP(opts.ID)
 	if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
 		if !errdefs.IsNotFound(err) {
 			log.Printf("warn: container delete %s: %v", opts.ID, err)
@@ -363,6 +395,7 @@ func (c *Client) StopContainer(id string, cni *CNI, ports []types.PortMapping) e
 		}
 	}
 
+	c.clearIP(id)
 	if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
 		if !errdefs.IsNotFound(err) {
 			return fmt.Errorf("delete container %s: %w", id, err)
@@ -393,6 +426,10 @@ type ContainerStatus struct {
 	ID     string                   `json:"id"`
 	Status containerd.ProcessStatus `json:"status"`
 	Pid    uint32                   `json:"pid"`
+	// IP is the container's CNI-assigned address. Empty when CNI is
+	// disabled, or briefly before Setup completes — treat empty as "not yet
+	// known", not "no IP".
+	IP string `json:"ip,omitempty"`
 }
 
 // ListRunning returns all containers in the smith namespace and their
@@ -412,6 +449,7 @@ func (c *Client) ListRunning() (map[string]ContainerStatus, error) {
 		status := ContainerStatus{
 			ID:     container.ID(),
 			Status: containerd.Unknown,
+			IP:     c.getIP(container.ID()),
 		}
 
 		// A container may exist without a task if it was created but
@@ -471,6 +509,7 @@ func (c *Client) Cleanup(id string, cni *CNI) error {
 		}
 	}
 
+	c.clearIP(id)
 	if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
 		if !errdefs.IsNotFound(err) {
 			return fmt.Errorf("delete container %s: %w", id, err)
