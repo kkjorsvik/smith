@@ -37,6 +37,7 @@ type Agent struct {
 	firewall   *smithruntime.Firewall
 	routeMgr   *smithruntime.RouteManager
 	svcProxy   *smithruntime.ServiceProxy
+	ingress    *ingressProxy
 	netCfg     types.NetworkConfig // assigned at registration
 	mu         sync.Mutex
 	ports      map[string][]types.PortMapping // workloadID -> ports
@@ -164,6 +165,12 @@ func (a *Agent) Start() error {
 	go a.serveHTTP(a.serverTLS)
 	go a.routeSyncLoop()
 	go a.serviceSyncLoop()
+
+	// Ingress reverse proxy: needs cluster networking (service ClusterIPs) to
+	// reach backends, so only when a subnet was assigned.
+	if netCfg.Subnet != "" {
+		a.startIngress()
+	}
 
 	return nil
 }
