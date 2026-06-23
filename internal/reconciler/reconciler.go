@@ -101,10 +101,13 @@ func (r *Reconciler) loop() {
 }
 
 func (r *Reconciler) reconcile() error {
-	desired, err := r.store.List()
+	stored, err := r.store.List()
 	if err != nil {
 		return fmt.Errorf("list desired: %w", err)
 	}
+	// Expand each workload into its replica instances; the rest of the loop
+	// drives the cluster toward this per-replica desired set.
+	desired := expand(stored)
 
 	// Detect dead nodes and evict their workloads back to unassigned.
 	for _, node := range r.registry.Dead() {
@@ -120,35 +123,35 @@ func (r *Reconciler) reconcile() error {
 		r.registry.Remove(node.ID)
 	}
 
-	// Ensure every desired workload is assigned and running on a node.
-	for _, workload := range desired {
-		assignment, err := r.scheduler.Assign(workload)
+	// Ensure every desired replica is assigned and running on a node.
+	for _, inst := range desired {
+		assignment, err := r.scheduler.Assign(inst.wl.ID, inst.parent)
 		if err != nil {
-			log.Printf("reconciler: assign %s: %v", workload.ID, err)
+			log.Printf("reconciler: assign %s: %v", inst.wl.ID, err)
 			continue
 		}
 
 		node, exists := r.registry.Get(assignment.NodeID)
 		if !exists {
-			log.Printf("reconciler: node %s not found for workload %s", assignment.NodeID, workload.ID)
-			r.scheduler.Unassign(workload.ID)
+			log.Printf("reconciler: node %s not found for replica %s", assignment.NodeID, inst.wl.ID)
+			r.scheduler.Unassign(inst.wl.ID)
 			continue
 		}
 
 		r.mu.Lock()
-		rec, exists := r.pushed[workload.ID]
+		rec, exists := r.pushed[inst.wl.ID]
 		alreadyPushed := exists && rec.nodeID == assignment.NodeID
 		r.mu.Unlock()
 
 		if !alreadyPushed {
-			if err := r.pushAssignment(node, workload); err != nil {
-				log.Printf("reconciler: push assignment %s to %s: %v", workload.ID, node.ID, err)
+			if err := r.pushAssignment(node, inst.wl); err != nil {
+				log.Printf("reconciler: push assignment %s to %s: %v", inst.wl.ID, node.ID, err)
 				continue
 			}
 			r.mu.Lock()
-			r.pushed[workload.ID] = pushRecord{nodeID: assignment.NodeID, pushedAt: time.Now()}
+			r.pushed[inst.wl.ID] = pushRecord{nodeID: assignment.NodeID, pushedAt: time.Now()}
 			r.mu.Unlock()
-			log.Printf("reconciler: pushed %s to %s", workload.ID, node.ID)
+			log.Printf("reconciler: pushed %s to %s", inst.wl.ID, node.ID)
 		}
 	}
 
@@ -197,6 +200,32 @@ func (r *Reconciler) reconcile() error {
 	}
 
 	return nil
+}
+
+// replicaInstance is one replica of a workload: a derived single-container
+// workload (ID = "<parent>-<index>") plus the parent workload ID.
+type replicaInstance struct {
+	wl     types.Workload
+	parent string
+}
+
+// expand turns each desired workload into its replica instances, keyed by
+// replica ID. A workload with Replicas < 1 yields a single replica "-0".
+func expand(desired map[string]types.Workload) map[string]replicaInstance {
+	out := make(map[string]replicaInstance)
+	for id, w := range desired {
+		n := w.Replicas
+		if n < 1 {
+			n = 1
+		}
+		for i := 0; i < n; i++ {
+			rw := w
+			rw.ID = fmt.Sprintf("%s-%d", id, i)
+			rw.Replicas = 0 // a replica instance is a single container
+			out[rw.ID] = replicaInstance{wl: rw, parent: id}
+		}
+	}
+	return out
 }
 
 // pushAssignment sends a workload assignment to an agent node.

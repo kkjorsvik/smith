@@ -14,6 +14,9 @@ type Workload struct {
 	Ports       []PortMapping     `json:"ports,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
 	Resources   *Resources        `json:"resources,omitempty"`
+	// Replicas is how many instances of this workload to run, spread across
+	// nodes. 0 or omitted means 1.
+	Replicas int `json:"replicas,omitempty"`
 }
 
 // Resources defines CPU and memory limits for a workload.
@@ -99,8 +102,11 @@ type Node struct {
 	MemoryMB      int       `json:"memory_mb"`
 }
 
-// Assignment represents a workload assigned to a specific node.
+// Assignment represents a workload replica assigned to a specific node.
+// WorkloadID is the replica instance ID (e.g. "smith-nginx-0"); ParentID is
+// the workload it belongs to.
 type Assignment struct {
 	WorkloadID string `json:"workload_id"`
 	NodeID     string `json:"node_id"`
+	ParentID   string `json:"parent_id,omitempty"`
 }
