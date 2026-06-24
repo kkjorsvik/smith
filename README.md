@@ -58,6 +58,9 @@ certificate obtained via the ACME **DNS-01** challenge (Route 53).
 - **Ingress (host-based HTTPS)** — map a hostname to a service; every agent runs
   a TLS-terminating reverse proxy on `:443` that routes by `Host:` using a
   control-plane-provisioned wildcard cert.
+- **Stateful workloads** — persistent **NFS-backed volumes** bind-mounted into a
+  container; data survives recreation, rolling updates, and node failover.
+  Volume-bearing workloads are single-replica (single writer).
 - **Failover** — when a node misses its heartbeat window it is declared dead and
   its replicas are rescheduled onto healthy nodes.
 - **Persistent desired state** — workloads, services, ingresses, and per-node
@@ -154,6 +157,9 @@ can't bind or no wildcard cert is available yet.
   in `/opt/cni/bin` on **agent** hosts — the per-node bridge network needs them.
   The control plane runs no workloads and needs none. (The agent setup script
   installs these for you; see [Provisioning](#provisioning-fresh-nodes-scripts).)
+- **`nfs-common`** on agent hosts **if** you run stateful workloads — provides
+  `mount.nfs` for [NFS-backed volumes](#stateful-workloads). Also installed by
+  the agent setup script.
 - **Root / privileged access** on each host — binding `:443`/`:80`/`:9443`,
   talking to the containerd socket, and writing `/etc/smith` and `/var/lib/smith`
   generally require it.
@@ -380,6 +386,7 @@ sudo ./bin/smith-server add-agent \
 | `-out` | `/etc/smith/certs` | Cert dir — **must already contain the CA** |
 | `-binary` | `bin/smith-agent` | Agent binary to embed in the bundle |
 | `-bundle` | `./<id>.tar.gz` | Output tarball path |
+| `-nfs` | _(empty)_ | Cluster NFS share for stateful volumes, e.g. `unraid.kkjorsvik.com:/mnt/user/smith` (sets `SMITH_NFS_SOURCE`) |
 
 `add-agent` issues one leaf against the existing CA (never regenerates it),
 verifies it chains, and packages a self-contained tarball: the agent's
@@ -459,6 +466,7 @@ A workload describes a container the cluster should keep running:
 | `env` | map? | Environment variables set in the container |
 | `ports` | object[]? | Host→container port mappings (`host_port`, `container_port`, `protocol`) published via the portmap CNI plugin |
 | `resources` | object? | `cpu_millicores` (1000 = 1 core) and `memory_mb` limits; also used as the scheduler's bin-packing request. `memory_mb` is enforced (OOM-kill) |
+| `volumes` | object[]? | Persistent NFS-backed mounts (`name`, `path`). Makes the workload stateful — see [Stateful workloads](#stateful-workloads). Limited to 1 replica |
 | `health_check` | object? | Optional probe (see below) |
 
 Changing `image`, `args`, `env`, `ports`, or `resources` triggers a **rolling
@@ -519,6 +527,46 @@ curl https://smith-server-01.kkjorsvik.com/ingresses \
 |-------|------|-------------|
 | `host` | string | FQDN to route (unique key; covered by `*.kkjorsvik.com`) |
 | `service` | string | Target service name |
+
+### Stateful workloads
+
+A workload with `volumes` is **stateful**: each volume is a directory on a
+cluster **NFS share** bind-mounted into the container. Because the share is
+reachable from every node, the data survives container recreation, rolling
+updates, agent restarts, and **node failover** — when a node dies the single
+replica reschedules elsewhere and mounts the same data. To guarantee a single
+writer, a volume-bearing workload is limited to **`replicas: 1`** (the API
+rejects more).
+
+Configure the share once per agent via `SMITH_NFS_SOURCE` (see
+[`add-agent -nfs`](#adding-an-agent)); smith stores each volume at
+`<share>/<workloadID>/<name>`. Agents need `nfs-common` (the setup script
+installs it). Volume data is **never auto-deleted** when a workload is removed.
+
+```json
+{
+  "id": "postgres",
+  "image": "docker.io/library/postgres:16",
+  "env": { "POSTGRES_PASSWORD": "..." },
+  "replicas": 1,
+  "resources": { "memory_mb": 512 },
+  "volumes": [{ "name": "data", "path": "/var/lib/postgresql/data" }]
+}
+```
+
+| Volume field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Unique within the workload; the NFS subdir name. Must match `[a-z0-9-]+` |
+| `path` | string | Absolute mount path inside the container |
+
+Front it with a **service** (ClusterIP) so other workloads reach it by a stable
+address — no ingress (it isn't HTTP).
+
+> **Caveats.** A network partition can briefly produce two writers (the old
+> replica keeps running while a new one starts after the 30s dead-timeout);
+> Postgres's lock file is unreliable over NFS, so treat backups as the real
+> durability net. Fencing/STONITH is out of scope. See
+> `docs/specs/stateful-volumes.md`.
 
 ---
 
@@ -728,7 +776,7 @@ internal/
   reconciler/    reconcile loop, push tracking, status aggregation; SQLite stores
                  (workloads, subnets, services, ingresses)
   registry/      node registry + liveness (heartbeat tracking)
-  runtime/       containerd client, CNI bridge, firewall, routes, service LB
+  runtime/       containerd client, CNI bridge, firewall, routes, service LB, NFS volumes
   scheduler/     resource-aware bin-packing placement + assignment tracking
   tls/           ServerConfig / ClientConfig helpers (mTLS, TLS 1.3)
   types/         shared types (Workload, Service, Ingress, Node, Assignment, …)

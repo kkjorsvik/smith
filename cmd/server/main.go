@@ -320,6 +320,7 @@ func runAddAgent() {
 	out := fs.String("out", "/etc/smith/certs", "Cert directory (must already contain the CA)")
 	binary := fs.String("binary", "bin/smith-agent", "Path to the smith-agent binary to bundle")
 	bundle := fs.String("bundle", "", "Output tarball path (default: ./<id>.tar.gz)")
+	nfs := fs.String("nfs", "", "Cluster NFS share for stateful volumes, e.g. unraid.kkjorsvik.com:/mnt/user/smith")
 	fs.Parse(os.Args[2:])
 
 	if *host == "" {
@@ -382,6 +383,7 @@ func runAddAgent() {
 		CertPEM:    certPEM,
 		KeyPEM:     keyPEM,
 		BinaryPath: *binary,
+		NFSSource:  *nfs,
 	}
 	if err := b.Write(f); err != nil {
 		log.Fatalf("add-agent: %v", err)

@@ -36,6 +36,7 @@ type AgentBundle struct {
 	CertPEM    []byte // this agent's leaf cert
 	KeyPEM     []byte // this agent's leaf key (written 0600 in the tar)
 	BinaryPath string // path to the smith-agent binary to embed
+	NFSSource  string // cluster NFS share for volumes (SMITH_NFS_SOURCE), or ""
 }
 
 // agentEnv renders the EnvironmentFile that drives the systemd unit. The cert
@@ -48,6 +49,9 @@ func (b AgentBundle) agentEnv() string {
 	fmt.Fprintf(&sb, "SMITH_CA=/etc/smith/certs/ca.crt\n")
 	fmt.Fprintf(&sb, "SMITH_CERT=/etc/smith/certs/%s.crt\n", b.ID)
 	fmt.Fprintf(&sb, "SMITH_KEY=/etc/smith/certs/%s.key\n", b.ID)
+	if b.NFSSource != "" {
+		fmt.Fprintf(&sb, "SMITH_NFS_SOURCE=%s\n", b.NFSSource)
+	}
 	return sb.String()
 }
 

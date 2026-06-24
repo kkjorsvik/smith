@@ -52,6 +52,20 @@ func testCA(t *testing.T, host string) (caCertPEM, leafCertPEM, leafKeyPEM []byt
 	return caCertPEM, leafCertPEM, leafKeyPEM
 }
 
+func TestAgentEnvNFSSource(t *testing.T) {
+	// Omitted when unset.
+	if env := (AgentBundle{ID: "a", Addr: "h:9000", Server: "s:9443"}).agentEnv(); contains(env, "SMITH_NFS_SOURCE") {
+		t.Errorf("SMITH_NFS_SOURCE should be absent when unset:\n%s", env)
+	}
+	// Present when set.
+	b := AgentBundle{ID: "a", Addr: "h:9000", Server: "s:9443", NFSSource: "unraid:/mnt/user/smith"}
+	if env := b.agentEnv(); !contains(env, "SMITH_NFS_SOURCE=unraid:/mnt/user/smith") {
+		t.Errorf("SMITH_NFS_SOURCE missing when set:\n%s", env)
+	}
+}
+
+func contains(s, sub string) bool { return bytes.Contains([]byte(s), []byte(sub)) }
+
 func TestVerifyLeaf(t *testing.T) {
 	ca, leaf, _ := testCA(t, "smith-agent-03.kkjorsvik.com")
 	if err := VerifyLeaf(ca, leaf); err != nil {

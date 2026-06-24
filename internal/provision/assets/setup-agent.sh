@@ -37,10 +37,11 @@ ca_file="$(basename "${SMITH_CA}")"
 cert_file="$(basename "${SMITH_CERT}")"
 key_file="$(basename "${SMITH_KEY}")"
 
-echo "==> Installing containerd"
+echo "==> Installing containerd + NFS client"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq containerd ca-certificates curl tar
+# nfs-common provides mount.nfs, needed for stateful workload volumes.
+apt-get install -y -qq containerd ca-certificates curl tar nfs-common
 systemctl enable --now containerd
 
 echo "==> Installing CNI plugins ${CNI_PLUGINS_VERSION} -> /opt/cni/bin"
