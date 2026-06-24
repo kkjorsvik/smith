@@ -543,6 +543,21 @@ Configure the share once per agent via `SMITH_NFS_SOURCE` (see
 `<share>/<workloadID>/<name>`. Agents need `nfs-common` (the setup script
 installs it). Volume data is **never auto-deleted** when a workload is removed.
 
+**NFS export requirements.** The share's export must:
+- **Allow the agent hosts** (e.g. an Unraid NFS Rule like
+  `192.168.1.0/24(sec=sys,rw,no_root_squash)` — or `*` to test). Host-based, no
+  user/password.
+- Use **`no_root_squash`**. Images like Postgres run their entrypoint as root and
+  `chown` their data dir; with root squashed that `chown` fails
+  (`Operation not permitted`) and the container crash-loops. smith creates each
+  volume dir **world-writable (0777)** so a container that drops to a non-root
+  uid (postgres=999, etc.) can still write — the app manages the perms of its own
+  data dir inside.
+
+> Tip: changing an NFS export rule while agents have the share mounted strands
+> the mount (`Stale file handle`). After editing the export, on each agent:
+> `sudo umount -f -l /var/lib/smith/nfs && sudo systemctl restart smith-agent`.
+
 ```json
 {
   "id": "postgres",

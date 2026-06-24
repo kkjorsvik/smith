@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -43,6 +44,16 @@ func TestResolveVolumes(t *testing.T) {
 	}
 	if mounts[0].Dest != "/var/lib/postgresql/data" {
 		t.Errorf("dest = %q, want /var/lib/postgresql/data", mounts[0].Dest)
+	}
+
+	// The mount dir must be world-writable so a container running as a non-root
+	// uid (e.g. postgres=999) can write into its volume.
+	info, err := os.Stat(mounts[0].Source)
+	if err != nil {
+		t.Fatalf("stat volume dir: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o777 {
+		t.Errorf("volume dir perms = %o, want 777", perm)
 	}
 }
 

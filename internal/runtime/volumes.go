@@ -38,10 +38,21 @@ func MountNFS(source string) error {
 // EnsureVolumeDir creates and returns the host path backing a workload volume:
 // <NFSMountRoot>/<baseID>/<name>. The directory is created on the NFS share if
 // absent and reused (data-preserving) if present.
+//
+// The mount dir is made world-writable (0777). Containers commonly run as a
+// non-root uid (postgres=999, etc.) — often re-exec'ing from root to that uid
+// mid-entrypoint — and must be able to write into their volume; the orchestrator
+// doesn't know that uid, so the dir is opened up and the app manages the perms
+// of its own data dir inside (Postgres chmods PGDATA to 0700 itself). The chmod
+// is explicit because MkdirAll is subject to umask, and it also corrects dirs
+// created 0700 by an older agent.
 func EnsureVolumeDir(baseID, name string) (string, error) {
 	dir := filepath.Join(NFSMountRoot, baseID, name)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return "", fmt.Errorf("ensure volume dir %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		return "", fmt.Errorf("chmod volume dir %s: %w", dir, err)
 	}
 	return dir, nil
 }
