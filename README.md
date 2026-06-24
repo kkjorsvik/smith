@@ -416,7 +416,12 @@ control-plane restart first — the per-agent restart re-registers each node
 regardless, so this also works when the agents are still on an older binary.
 Each agent's containers cycle briefly as it restarts, so spread a workload's
 `replicas` across nodes (and front it with a service) to stay up during the roll.
-Requires `jq` and ssh access to the agents.
+
+Run it as your normal user (it `sudo`s the privileged local steps); starting it
+with `sudo` works too — either way `ssh`/`scp` use *your* keys, since root on the
+control plane has none for the agents. Requirements: `jq`, ssh access to the
+agents, and that your user can `sudo` **non-interactively** (NOPASSWD) on the
+agents — the remote binary swap runs `sudo` over a non-interactive ssh.
 
 ---
 
