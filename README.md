@@ -558,6 +558,19 @@ installs it). Volume data is **never auto-deleted** when a workload is removed.
 > the mount (`Stale file handle`). After editing the export, on each agent:
 > `sudo umount -f -l /var/lib/smith/nfs && sudo systemctl restart smith-agent`.
 
+**Sharing one Postgres across services.** Run a single `postgres` workload with a
+superuser password, expose it as a service (stable ClusterIP), and give each app
+its own database + role — added live, with no change to the workload.
+`scripts/provision-db.sh <app>` does that (looks up the service NodePort and runs
+`CREATE DATABASE`/`CREATE ROLE`/`GRANT`, generating a password):
+
+```bash
+./scripts/provision-db.sh forgejo
+# -> database/user "forgejo" + a generated password; point the app's DB env at
+#    the postgres ClusterIP. Re-run per new service (woodpecker, n8n, …).
+```
+Each app connects to the same `<clusterip>:5432` with its own `NAME`/`USER`/`PASSWD`.
+
 ```json
 {
   "id": "postgres",
@@ -796,7 +809,7 @@ internal/
   tls/           ServerConfig / ClientConfig helpers (mTLS, TLS 1.3)
   types/         shared types (Workload, Service, Ingress, Node, Assignment, …)
   ui/            embedded web dashboard (go:embed)
-scripts/         setup-server.sh + systemd unit (provisioning); update.sh (rolling update)
+scripts/         setup-server.sh + unit (provisioning); update.sh (rolling update); provision-db.sh (shared Postgres)
 docs/specs/      design specs, one per feature
 ```
 
