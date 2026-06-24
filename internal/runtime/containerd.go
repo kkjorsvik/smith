@@ -140,6 +140,16 @@ type RunOptions struct {
 	Env map[string]string
 	// Resources, when non-nil, applies CPU and memory cgroup limits.
 	Resources *types.Resources
+	// Mounts are host->container bind mounts for persistent volumes. The
+	// source is a host path (typically under the NFS mount); it is bind-mounted
+	// read-write at Dest inside the container.
+	Mounts []Mount
+}
+
+// Mount is a host->container bind mount.
+type Mount struct {
+	Source string // host path
+	Dest   string // absolute path inside the container
 }
 
 // RunContainer creates a container, starts it, waits for it to exit,
@@ -176,6 +186,18 @@ func (c *Client) RunContainer(opts RunOptions) (uint32, error) {
 			quota := int64(opts.Resources.CPUMillicores) * 100
 			specOpts = append(specOpts, oci.WithCPUCFS(quota, period))
 		}
+	}
+	if len(opts.Mounts) > 0 {
+		mounts := make([]specs.Mount, 0, len(opts.Mounts))
+		for _, m := range opts.Mounts {
+			mounts = append(mounts, specs.Mount{
+				Destination: m.Dest,
+				Type:        "bind",
+				Source:      m.Source,
+				Options:     []string{"rbind", "rw"},
+			})
+		}
+		specOpts = append(specOpts, oci.WithMounts(mounts))
 	}
 
 	// NewContainer creates the metadata record and a fresh writable

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	goruntime "runtime"
 	"sync"
 	"time"
@@ -40,6 +41,7 @@ type Agent struct {
 	svcProxy   *smithruntime.ServiceProxy
 	ingress    *ingressProxy
 	netCfg     types.NetworkConfig // assigned at registration
+	nfsSource  string              // cluster NFS share for volumes (SMITH_NFS_SOURCE), or ""
 	mu         sync.Mutex
 	ports      map[string][]types.PortMapping // workloadID -> ports
 }
@@ -79,6 +81,7 @@ func New(id, addr, hostIP, serverAddr string, client *smithruntime.Client, clien
 		httpClient: httpClient,
 		serverTLS:  serverTLS,
 		firewall:   fw,
+		nfsSource:  os.Getenv("SMITH_NFS_SOURCE"),
 		ports:      make(map[string][]types.PortMapping),
 	}
 }
@@ -144,6 +147,17 @@ func (a *Agent) Start() error {
 	}
 	if err := smithruntime.EnableIPForwarding(); err != nil {
 		log.Printf("agent: enable ip_forward: %v", err)
+	}
+
+	// Mount the cluster NFS share once, if configured, so stateful workloads
+	// can bind-mount their volume directories from it. Best-effort: without it,
+	// only stateless workloads run on this node.
+	if a.nfsSource != "" {
+		if err := smithruntime.MountNFS(a.nfsSource); err != nil {
+			log.Printf("agent: mount NFS %s failed, stateful workloads disabled: %v", a.nfsSource, err)
+		} else {
+			log.Printf("agent: NFS share %s mounted at %s", a.nfsSource, smithruntime.NFSMountRoot)
+		}
 	}
 
 	// Clear ghost containers left by a previous unclean shutdown, releasing
@@ -462,6 +476,16 @@ func (a *Agent) handleAssign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Resolve persistent volumes to host bind mounts under the NFS share. The
+	// volume dir is keyed by the parent workload ID so it is stable across the
+	// replica's recreation, rolling updates, and node failover.
+	mounts, err := a.resolveVolumes(wl)
+	if err != nil {
+		log.Printf("agent: volumes for %s: %v", wl.ID, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	go func() {
 		image, err := a.client.GetImage(wl.Image)
 		if err != nil {
@@ -479,6 +503,7 @@ func (a *Agent) handleAssign(w http.ResponseWriter, r *http.Request) {
 			Ports:     wl.Ports,
 			Env:       wl.Env,
 			Resources: wl.Resources,
+			Mounts:    mounts,
 			CNI:       a.cni,
 		})
 		if err != nil {
@@ -493,6 +518,33 @@ func (a *Agent) handleAssign(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// replicaSuffixRe matches the trailing "-<index>" a replica ID carries, so the
+// parent workload ID can be recovered for stable per-workload volume paths.
+var replicaSuffixRe = regexp.MustCompile(`-\d+$`)
+
+// resolveVolumes turns a workload's persistent volumes into host bind mounts
+// under the NFS share. Returns an error (failing the assign) if the workload
+// declares volumes but this node has no NFS share mounted.
+func (a *Agent) resolveVolumes(wl types.Workload) ([]smithruntime.Mount, error) {
+	if len(wl.Volumes) == 0 {
+		return nil, nil
+	}
+	if a.nfsSource == "" {
+		return nil, fmt.Errorf("workload %s has volumes but this node has no NFS share (SMITH_NFS_SOURCE unset)", wl.ID)
+	}
+
+	baseID := replicaSuffixRe.ReplaceAllString(wl.ID, "")
+	mounts := make([]smithruntime.Mount, 0, len(wl.Volumes))
+	for _, v := range wl.Volumes {
+		hostPath, err := smithruntime.EnsureVolumeDir(baseID, v.Name)
+		if err != nil {
+			return nil, err
+		}
+		mounts = append(mounts, smithruntime.Mount{Source: hostPath, Dest: v.Path})
+	}
+	return mounts, nil
 }
 
 // handleUnassign receives a removal request from the control plane
