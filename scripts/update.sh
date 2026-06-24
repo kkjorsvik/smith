@@ -51,12 +51,14 @@ TOKEN="$(asroot cat /etc/smith/token)"
 api() { curl -fsS -H "Authorization: Bearer ${TOKEN}" "https://${SERVER_HOST}$1" 2>/dev/null; }
 node_id()   { echo "${1%%.*}"; }   # smith-agent-01.kkjorsvik.com -> smith-agent-01
 
-# count of running containers the cluster reports on a node
-running_count() { api /status 2>/dev/null | jq --arg n "$1" '[.[$n][]? | select(.status=="running")] | length' 2>/dev/null || echo 0; }
+# total running containers across the whole cluster. A replica bounced during a
+# roll may reschedule to a DIFFERENT node and stay there (sticky), so cluster-wide
+# total — not per-node count — is the right measure of recovery.
+cluster_running_total() { api /status 2>/dev/null | jq '[.[] | .[]? | select(.status=="running")] | length' 2>/dev/null || echo 0; }
 
 # predicates (called directly by poll, so they stay in function scope)
-node_present()      { api /nodes 2>/dev/null | jq -e --arg n "$1" 'any(.[]; .id==$n)' >/dev/null 2>&1; }
-replicas_restored() { (( "$(running_count "$1")" >= "$2" )); }
+node_present()    { api /nodes 2>/dev/null | jq -e --arg n "$1" 'any(.[]; .id==$n)' >/dev/null 2>&1; }
+total_restored()  { (( "$(cluster_running_total)" >= "$1" )); }
 
 # poll <desc> <timeout_s> <predicate> [args...]
 poll() {
@@ -71,16 +73,10 @@ poll() {
   done
 }
 
-# Record baselines BEFORE any disruption, while the old agents are still
-# registered, so the per-agent recovery check compares against real counts.
-# Best-effort: a node not currently registered reads as 0.
-declare -A BEFORE
-echo "==> Recording current replica counts"
-for h in "${AGENTS[@]}"; do
-  nid="$(node_id "$h")"
-  BEFORE[$nid]="$(running_count "$nid")"
-  echo "    ${nid}: ${BEFORE[$nid]} running"
-done
+# Record the cluster-wide running total BEFORE any disruption. Each agent roll
+# must bring the cluster back to this many running replicas — wherever they land.
+TOTAL_BEFORE="$(cluster_running_total)"
+echo "==> ${TOTAL_BEFORE} running replicas cluster-wide before update"
 
 echo "==> Building binaries in ${REPO_DIR}"
 ( cd "$REPO_DIR" && go build -o bin/smith-server ./cmd/server && go build -o bin/smith-agent ./cmd/agent )
@@ -99,7 +95,7 @@ echo "    control plane back up"
 # re-registers it at startup regardless — the roll itself brings every node back.
 for h in "${AGENTS[@]}"; do
   nid="$(node_id "$h")"
-  echo "==> Rolling ${nid} (${h}) — ${BEFORE[$nid]} running replicas before update"
+  echo "==> Rolling ${nid} (${h})"
 
   asuser scp -q "${REPO_DIR}/bin/smith-agent" "${h}:~/smith-agent.new"
   asuser ssh "$h" 'sudo install -m0755 ~/smith-agent.new /usr/local/bin/smith-agent && sudo systemctl restart smith-agent && rm -f ~/smith-agent.new'
@@ -112,12 +108,14 @@ for h in "${AGENTS[@]}"; do
     exit 1
   fi
 
-  # Replica recovery is best-effort: a quick restart keeps assignments sticky to
-  # this node, but a slow one (>30s dead threshold) may move them elsewhere.
-  if poll "${nid} replicas to return to running (>= ${BEFORE[$nid]})" 180 replicas_restored "$nid" "${BEFORE[$nid]}"; then
-    echo "    ${nid} healthy"
+  # Wait for the cluster to return to its pre-roll running total before touching
+  # the next node. Replicas bounced off this node may come back here OR move to
+  # another node and stay (sticky) — either way the cluster total recovers, so we
+  # check that, not this node's own count.
+  if poll "cluster to return to ${TOTAL_BEFORE} running replicas" 180 total_restored "$TOTAL_BEFORE"; then
+    echo "    cluster healthy (${TOTAL_BEFORE} running)"
   else
-    echo "    WARNING: ${nid} did not return to ${BEFORE[$nid]} running replicas — check journalctl -u smith-agent on ${h}" >&2
+    echo "    WARNING: cluster below ${TOTAL_BEFORE} running replicas — check the agents before continuing" >&2
   fi
 done
 
