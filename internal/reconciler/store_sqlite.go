@@ -50,7 +50,8 @@ func (s *SQLiteStore) migrate() error {
 			env TEXT,
 			resources TEXT,
 			replicas INTEGER,
-			max_unavailable INTEGER
+			max_unavailable INTEGER,
+			volumes TEXT
 		);
 	`); err != nil {
 		return fmt.Errorf("create workloads table: %w", err)
@@ -69,6 +70,7 @@ func (s *SQLiteStore) migrate() error {
 		{"resources", "ALTER TABLE workloads ADD COLUMN resources TEXT"},
 		{"replicas", "ALTER TABLE workloads ADD COLUMN replicas INTEGER"},
 		{"max_unavailable", "ALTER TABLE workloads ADD COLUMN max_unavailable INTEGER"},
+		{"volumes", "ALTER TABLE workloads ADD COLUMN volumes TEXT"},
 	}
 
 	for _, c := range columns {
@@ -160,9 +162,17 @@ func (s *SQLiteStore) Add(w types.Workload) error {
 		}
 	}
 
+	var volumes []byte
+	if len(w.Volumes) > 0 {
+		volumes, err = json.Marshal(w.Volumes)
+		if err != nil {
+			return fmt.Errorf("marshal volumes for %s: %w", w.ID, err)
+		}
+	}
+
 	_, err = s.db.Exec(`
-		INSERT INTO workloads (id, image, args, health_check, ports, env, resources, replicas, max_unavailable)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO workloads (id, image, args, health_check, ports, env, resources, replicas, max_unavailable, volumes)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			image           = excluded.image,
 			args            = excluded.args,
@@ -171,8 +181,9 @@ func (s *SQLiteStore) Add(w types.Workload) error {
 			env             = excluded.env,
 			resources       = excluded.resources,
 			replicas        = excluded.replicas,
-			max_unavailable = excluded.max_unavailable;
-	`, w.ID, w.Image, string(args), string(hc), string(ports), string(env), string(resources), w.Replicas, w.MaxUnavailable)
+			max_unavailable = excluded.max_unavailable,
+			volumes         = excluded.volumes;
+	`, w.ID, w.Image, string(args), string(hc), string(ports), string(env), string(resources), w.Replicas, w.MaxUnavailable, string(volumes))
 	if err != nil {
 		return fmt.Errorf("upsert workload %s: %w", w.ID, err)
 	}
@@ -191,7 +202,7 @@ func (s *SQLiteStore) Remove(id string) error {
 func (s *SQLiteStore) List() (map[string]types.Workload, error) {
 	// COALESCE guards against NULL health_check values, which exist on rows
 	// created before the column was added by an ALTER TABLE migration.
-	rows, err := s.db.Query(`SELECT id, image, args, COALESCE(health_check, ''), COALESCE(ports, ''), COALESCE(env, ''), COALESCE(resources, ''), COALESCE(replicas, 0), COALESCE(max_unavailable, 0) FROM workloads`)
+	rows, err := s.db.Query(`SELECT id, image, args, COALESCE(health_check, ''), COALESCE(ports, ''), COALESCE(env, ''), COALESCE(resources, ''), COALESCE(replicas, 0), COALESCE(max_unavailable, 0), COALESCE(volumes, '') FROM workloads`)
 	if err != nil {
 		return nil, fmt.Errorf("query workloads: %w", err)
 	}
@@ -205,8 +216,9 @@ func (s *SQLiteStore) List() (map[string]types.Workload, error) {
 		var ports string
 		var env string
 		var resources string
+		var volumes string
 
-		if err := rows.Scan(&w.ID, &w.Image, &args, &hc, &ports, &env, &resources, &w.Replicas, &w.MaxUnavailable); err != nil {
+		if err := rows.Scan(&w.ID, &w.Image, &args, &hc, &ports, &env, &resources, &w.Replicas, &w.MaxUnavailable, &volumes); err != nil {
 			return nil, fmt.Errorf("scan workload: %w", err)
 		}
 
@@ -237,6 +249,12 @@ func (s *SQLiteStore) List() (map[string]types.Workload, error) {
 			w.Resources = &types.Resources{}
 			if err := json.Unmarshal([]byte(resources), w.Resources); err != nil {
 				return nil, fmt.Errorf("unmarshal resources for %s: %w", w.ID, err)
+			}
+		}
+
+		if volumes != "" && volumes != "null" {
+			if err := json.Unmarshal([]byte(volumes), &w.Volumes); err != nil {
+				return nil, fmt.Errorf("unmarshal volumes for %s: %w", w.ID, err)
 			}
 		}
 

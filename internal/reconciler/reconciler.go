@@ -297,7 +297,8 @@ func specHash(w types.Workload) string {
 		Env       map[string]string   `json:"env"`
 		Ports     []types.PortMapping `json:"ports"`
 		Resources *types.Resources    `json:"resources"`
-	}{w.Image, w.Args, w.Env, w.Ports, w.Resources}
+		Volumes   []types.Volume      `json:"volumes"`
+	}{w.Image, w.Args, w.Env, w.Ports, w.Resources, w.Volumes}
 
 	// encoding/json sorts map keys, so Env ordering is stable.
 	b, _ := json.Marshal(canonical)

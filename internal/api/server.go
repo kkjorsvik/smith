@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 
 	acmedns "github.com/kkjorsvik/smith/internal/acme"
@@ -401,6 +402,11 @@ func (s *Server) addWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := validateWorkload(wl); err != nil {
+		httpError(w, err, http.StatusBadRequest)
+		return
+	}
+
 	if err := s.store.Add(wl); err != nil {
 		httpError(w, fmt.Errorf("add workload: %w", err), http.StatusBadRequest)
 		return
@@ -408,6 +414,37 @@ func (s *Server) addWorkload(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("api: added workload %s", wl.ID)
 	writeJSON(w, http.StatusCreated, wl)
+}
+
+// volumeNameRe restricts a volume name to a safe NFS subdirectory component.
+var volumeNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+// validateWorkload enforces the invariants the rest of the system relies on,
+// notably the single-writer rule for stateful (volume-bearing) workloads.
+func validateWorkload(wl types.Workload) error {
+	if len(wl.Volumes) == 0 {
+		return nil
+	}
+
+	// Single writer: a shared NFS data dir must not be mounted by two replicas.
+	if wl.Replicas > 1 {
+		return fmt.Errorf("workload %s has volumes and so is limited to 1 replica (got %d)", wl.ID, wl.Replicas)
+	}
+
+	seen := make(map[string]bool, len(wl.Volumes))
+	for _, v := range wl.Volumes {
+		if !volumeNameRe.MatchString(v.Name) {
+			return fmt.Errorf("workload %s: volume name %q must match [a-z0-9-]+", wl.ID, v.Name)
+		}
+		if seen[v.Name] {
+			return fmt.Errorf("workload %s: duplicate volume name %q", wl.ID, v.Name)
+		}
+		seen[v.Name] = true
+		if !strings.HasPrefix(v.Path, "/") {
+			return fmt.Errorf("workload %s: volume %q path %q must be absolute", wl.ID, v.Name, v.Path)
+		}
+	}
+	return nil
 }
 
 // removeWorkload deletes a workload from the desired state store.

@@ -20,6 +20,21 @@ type Workload struct {
 	// MaxUnavailable is how many replicas may be down at once during a rolling
 	// update. 0 or omitted means 1.
 	MaxUnavailable int `json:"max_unavailable,omitempty"`
+	// Volumes are persistent NFS-backed mounts. A workload with volumes is
+	// stateful and is restricted to a single replica (single writer).
+	Volumes []Volume `json:"volumes,omitempty"`
+}
+
+// Volume is a persistent mount backed by the cluster NFS share. The agent
+// stores it at <SMITH_NFS_SOURCE>/<workloadID>/<Name> and bind-mounts that into
+// the container at Path. Data survives container recreation and node failover.
+type Volume struct {
+	// Name is unique within the workload and names the NFS subdirectory.
+	// Restricted to [a-z0-9-]+.
+	Name string `json:"name"`
+	// Path is the absolute mount path inside the container, e.g.
+	// "/var/lib/postgresql/data".
+	Path string `json:"path"`
 }
 
 // Resources defines CPU and memory limits for a workload.
