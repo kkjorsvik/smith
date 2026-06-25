@@ -69,6 +69,7 @@
   <section><h2>Nodes</h2><div id="nodes"></div></section>
   <section><h2>Workloads</h2><div id="workloads"></div></section>
   <section><h2>Services</h2><div id="services"></div></section>
+  <section><h2>Ingresses</h2><div id="ingresses"></div></section>
 </main>
 
 <div class="overlay" id="gate">
@@ -129,8 +130,8 @@ function err(msg) {
 async function refresh() {
   if (!token) { showGate(true); return; }
   try {
-    const [nodes, workloads, status, assignments, services] = await Promise.all([
-      api("/nodes"), api("/workloads"), api("/status"), api("/assignments"), api("/services"),
+    const [nodes, workloads, status, assignments, services, ingresses] = await Promise.all([
+      api("/nodes"), api("/workloads"), api("/status"), api("/assignments"), api("/services"), api("/ingresses"),
     ]);
     err(null);
 
@@ -144,6 +145,7 @@ async function refresh() {
     renderNodes(nodes || [], byReplica);
     renderWorkloads(workloads || [], byReplica);
     renderServices(services || [], byReplica, parentOf);
+    renderIngresses(ingresses || [], services || []);
     $("updated").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {
     if (e.message !== "unauthorized") err("Failed to load: " + e.message);
@@ -231,6 +233,25 @@ function renderServices(services, byReplica, parentOf) {
     );
   });
   c.replaceChildren(table(["Name", "Workload", "ClusterIP", "NodePort", "Endpoints"], rows));
+}
+
+function renderIngresses(ingresses, services) {
+  const c = $("ingresses");
+  if (!ingresses.length) { c.replaceChildren(h("div", { class: "empty" }, "no ingresses")); return; }
+  const svcByName = {};
+  for (const s of services) svcByName[s.name] = s;
+  const rows = ingresses.map(ing => {
+    const svc = svcByName[ing.service];
+    const target = svc
+      ? h("span", {}, h("span", { class: "ip" }, svc.cluster_ip), ":" + svc.port)
+      : badge("missing service", "bad");
+    return h("tr", {},
+      h("td", {}, h("a", { class: "link", href: "https://" + ing.host, target: "_blank", rel: "noopener" }, ing.host)),
+      h("td", {}, ing.service),
+      h("td", {}, target),
+    );
+  });
+  c.replaceChildren(table(["Host", "Service", "Target"], rows));
 }
 
 async function showLogs(rid) {
