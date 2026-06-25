@@ -3,6 +3,7 @@ package manifest
 import (
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/kkjorsvik/smith/internal/types"
 )
@@ -55,12 +56,21 @@ func (a *App) resolveWorkload() (types.Workload, error) {
 	if w.Image == "" {
 		return types.Workload{}, fmt.Errorf("workload.image is required")
 	}
+	if w.Replicas < 0 {
+		return types.Workload{}, fmt.Errorf("workload.replicas must be >= 0 (got %d)", w.Replicas)
+	}
+	if w.MaxUnavailable < 0 {
+		return types.Workload{}, fmt.Errorf("workload.max_unavailable must be >= 0 (got %d)", w.MaxUnavailable)
+	}
 	replicas := w.Replicas
 	if replicas == 0 {
 		replicas = 1
 	}
 	if len(w.Volumes) > 0 && replicas > 1 {
 		return types.Workload{}, fmt.Errorf("workload with volumes must have replicas: 1 (single writer)")
+	}
+	if err := validateVolumes(w.Volumes); err != nil {
+		return types.Workload{}, err
 	}
 	maxUnavail := w.MaxUnavailable
 	if maxUnavail == 0 {
@@ -78,6 +88,27 @@ func (a *App) resolveWorkload() (types.Workload, error) {
 		Ports:          w.Ports,
 		HealthCheck:    w.HealthCheck,
 	}, nil
+}
+
+// validateVolumes mirrors the control plane's volume invariants (see
+// internal/api validateWorkload) so a bad volume name or path fails at resolve
+// time rather than only at apply time: names must be a safe NFS subdirectory
+// component, be unique, and mount paths must be absolute.
+func validateVolumes(vols []types.Volume) error {
+	seen := make(map[string]bool, len(vols))
+	for _, v := range vols {
+		if !nameRe.MatchString(v.Name) {
+			return fmt.Errorf("volume name %q must match [a-z0-9-]+", v.Name)
+		}
+		if seen[v.Name] {
+			return fmt.Errorf("duplicate volume name %q", v.Name)
+		}
+		seen[v.Name] = true
+		if !strings.HasPrefix(v.Path, "/") {
+			return fmt.Errorf("volume %q path %q must be absolute", v.Name, v.Path)
+		}
+	}
+	return nil
 }
 
 func (a *App) resolveServices() ([]types.Service, error) {
@@ -118,6 +149,9 @@ func (a *App) resolveServices() ([]types.Service, error) {
 		proto := s.Protocol
 		if proto == "" {
 			proto = "tcp"
+		}
+		if proto != "tcp" && proto != "udp" {
+			return nil, fmt.Errorf("service %q: protocol %q must be tcp or udp", name, proto)
 		}
 		out = append(out, types.Service{
 			Name:       name,

@@ -100,6 +100,26 @@ func TestResolveListMode(t *testing.T) {
 	}
 }
 
+// TestResolveOneEntryListDefaultsIngress checks the count-based ingress rule
+// holds when the sole service is written as a one-entry services: list (not
+// just singular service:) — the ingress with no explicit ref should still
+// default to that one service.
+func TestResolveOneEntryListDefaultsIngress(t *testing.T) {
+	app := &App{
+		Name:     "app",
+		Workload: WorkloadSpec{Image: "nginx"},
+		Services: []ServiceSpec{{Name: "web", Port: 80}},
+		Ingress:  &IngressSpec{Host: "app.kkjorsvik.com"},
+	}
+	got, err := app.Resolve()
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if len(got.Ingresses) != 1 || got.Ingresses[0].Service != "web" {
+		t.Errorf("ingress = %+v, want service web", got.Ingresses)
+	}
+}
+
 func TestResolveErrors(t *testing.T) {
 	cases := []struct {
 		name string
@@ -141,6 +161,57 @@ func TestResolveErrors(t *testing.T) {
 				Ingresses: []IngressSpec{{Host: "b.example.com"}},
 			},
 			want: "either ingress or ingresses",
+		},
+		{
+			name: "negative replicas",
+			app: &App{
+				Name:     "app",
+				Workload: WorkloadSpec{Image: "nginx", Replicas: -3},
+			},
+			want: "replicas must be >= 0",
+		},
+		{
+			name: "negative max_unavailable",
+			app: &App{
+				Name:     "app",
+				Workload: WorkloadSpec{Image: "nginx", MaxUnavailable: -1},
+			},
+			want: "max_unavailable must be >= 0",
+		},
+		{
+			name: "bad volume name",
+			app: &App{
+				Name:     "db",
+				Workload: WorkloadSpec{Image: "postgres:18", Volumes: []types.Volume{{Name: "Data", Path: "/data"}}},
+			},
+			want: "volume name",
+		},
+		{
+			name: "duplicate volume name",
+			app: &App{
+				Name: "db",
+				Workload: WorkloadSpec{Image: "postgres:18", Volumes: []types.Volume{
+					{Name: "data", Path: "/data"}, {Name: "data", Path: "/other"},
+				}},
+			},
+			want: "duplicate volume name",
+		},
+		{
+			name: "relative volume path",
+			app: &App{
+				Name:     "db",
+				Workload: WorkloadSpec{Image: "postgres:18", Volumes: []types.Volume{{Name: "data", Path: "data"}}},
+			},
+			want: "must be absolute",
+		},
+		{
+			name: "invalid protocol",
+			app: &App{
+				Name:     "app",
+				Workload: WorkloadSpec{Image: "nginx"},
+				Service:  &ServiceSpec{Port: 80, Protocol: "htcp"},
+			},
+			want: "must be tcp or udp",
 		},
 		{
 			name: "volumes force single replica",
