@@ -119,7 +119,7 @@ func (a *Agent) Start() error {
 		}
 
 		// Service proxy programs load-balancing rules for services.
-		sp, err := smithruntime.NewServiceProxy(smithruntime.BridgeSubnet)
+		sp, err := smithruntime.NewServiceProxy()
 		if err != nil {
 			log.Printf("agent: service proxy init failed, services disabled: %v", err)
 		} else {

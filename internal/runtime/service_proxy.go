@@ -26,22 +26,21 @@ const (
 // mode, simplified). It is reconciled from the control plane's endpoint list
 // on every sync and owns the SMITH-* chains.
 type ServiceProxy struct {
-	ipt     *iptables.IPTables
-	podCIDR string
+	ipt *iptables.IPTables
 	// nodePorts currently opened in filter/INPUT, port -> protocol, so stale
 	// ones can be closed when a service goes away.
 	nodePorts map[int]string
 }
 
-// NewServiceProxy returns a ServiceProxy. podCIDR is the pod network used to
-// decide which traffic needs masquerading (anything not from a pod, plus
-// hairpin from a backend).
-func NewServiceProxy(podCIDR string) (*ServiceProxy, error) {
+// NewServiceProxy returns a ServiceProxy. Service traffic is masqueraded
+// unconditionally (see populateServiceChain), so no pod-network argument is
+// needed.
+func NewServiceProxy() (*ServiceProxy, error) {
 	ipt, err := iptables.New()
 	if err != nil {
 		return nil, fmt.Errorf("init iptables: %w", err)
 	}
-	return &ServiceProxy{ipt: ipt, podCIDR: podCIDR, nodePorts: make(map[int]string)}, nil
+	return &ServiceProxy{ipt: ipt, nodePorts: make(map[int]string)}, nil
 }
 
 // serviceChain returns the nat chain name for a service (<=28 chars).
@@ -134,15 +133,18 @@ func (p *ServiceProxy) populateServiceChain(chain string, svc types.ServiceEndpo
 		proto = "tcp"
 	}
 
-	// SNAT external/host traffic (NodePort from outside, host -> ClusterIP).
-	if err := p.ipt.Append(natTable, chain, "!", "-s", p.podCIDR, "-j", markChain); err != nil {
+	// Mark every connection entering the service for masquerade (SNAT to the
+	// node IP in POSTROUTING). This is required for the same-node hairpin: when
+	// a pod reaches a ClusterIP whose selected backend is a pod on the SAME
+	// node, the backend would otherwise reply directly over the bridge, bypass
+	// the node's conntrack, and the client would drop the un-rewritten reply.
+	// SNAT forces the reply back through conntrack so it gets un-DNAT'd. It also
+	// covers external/NodePort ingress and a backend hitting its own service.
+	// Trade-off: backends see the node IP, not the client pod IP (kube-proxy's
+	// --masquerade-all behavior). Direct, non-service pod-to-pod traffic does
+	// not pass through here and keeps its real source IP.
+	if err := p.ipt.Append(natTable, chain, "-j", markChain); err != nil {
 		return err
-	}
-	// SNAT hairpin (a backend reaching its own service).
-	for _, ep := range svc.Endpoints {
-		if err := p.ipt.Append(natTable, chain, "-s", ep+"/32", "-j", markChain); err != nil {
-			return err
-		}
 	}
 
 	// Random uniform selection: rule i fires with probability 1/(N-i); the
