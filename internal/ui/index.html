@@ -152,6 +152,13 @@ async function refresh() {
   }
 }
 
+// byKey returns a copy of arr sorted by key(item), using a numeric-aware
+// compare so e.g. "agent-2" sorts before "agent-10".
+const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+function byKey(arr, key) {
+  return [...arr].sort((a, b) => collator.compare(key(a), key(b)));
+}
+
 function badge(text, cls) { return h("span", { class: "badge " + (cls || "") }, text); }
 
 function aliveBadge(node) {
@@ -177,7 +184,7 @@ function renderNodes(nodes, byReplica) {
   if (!nodes.length) { c.replaceChildren(h("div", { class: "empty" }, "no nodes registered")); return; }
   const running = {};
   for (const r of Object.values(byReplica)) if (r.status === "running") running[r.node] = (running[r.node] || 0) + 1;
-  const rows = nodes.map(n => h("tr", {},
+  const rows = byKey(nodes, n => n.id || "").map(n => h("tr", {},
     h("td", {}, n.id),
     h("td", {}, n.host_ip || ""),
     h("td", { class: "num" }, String(n.cpu)),
@@ -191,7 +198,7 @@ function renderNodes(nodes, byReplica) {
 function renderWorkloads(workloads, byReplica) {
   const c = $("workloads");
   if (!workloads.length) { c.replaceChildren(h("div", { class: "empty" }, "no workloads")); return; }
-  const rows = workloads.map(w => {
+  const rows = byKey(workloads, w => w.id || "").map(w => {
     const n = w.replicas && w.replicas > 0 ? w.replicas : 1;
     const reps = [];
     for (let i = 0; i < n; i++) {
@@ -219,7 +226,7 @@ function renderWorkloads(workloads, byReplica) {
 function renderServices(services, byReplica, parentOf) {
   const c = $("services");
   if (!services.length) { c.replaceChildren(h("div", { class: "empty" }, "no services")); return; }
-  const rows = services.map(s => {
+  const rows = byKey(services, s => s.name || "").map(s => {
     let ready = 0;
     for (const [rid, r] of Object.entries(byReplica)) {
       if (parentOf[rid] === s.workload_id && r.status === "running" && r.ip) ready++;
@@ -240,7 +247,7 @@ function renderIngresses(ingresses, services) {
   if (!ingresses.length) { c.replaceChildren(h("div", { class: "empty" }, "no ingresses")); return; }
   const svcByName = {};
   for (const s of services) svcByName[s.name] = s;
-  const rows = ingresses.map(ing => {
+  const rows = byKey(ingresses, ing => ing.host || "").map(ing => {
     const svc = svcByName[ing.service];
     const target = svc
       ? h("span", {}, h("span", { class: "ip" }, svc.cluster_ip), ":" + svc.port)
