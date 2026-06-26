@@ -13,6 +13,7 @@ require (
 	github.com/opencontainers/runtime-spec v1.1.0
 	github.com/vishvananda/netlink v1.2.1
 	golang.org/x/crypto v0.53.0
+	sigs.k8s.io/yaml v1.4.0
 )
 
 require (
