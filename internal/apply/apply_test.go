@@ -106,6 +106,12 @@ func TestApplyDryRun(t *testing.T) {
 	if !strings.Contains(out.String(), "plan (dry run") {
 		t.Errorf("output missing plan header: %q", out.String())
 	}
+	// The plan must show the resolved resources, not just the header.
+	for _, want := range []string{"workload alpha", "image=nginx", "service alpha", "port=80", "ingress alpha.example.com -> service alpha"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("plan output missing %q; got:\n%s", want, out.String())
+		}
+	}
 }
 
 func TestApplyFailFast(t *testing.T) {

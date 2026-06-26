@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/kkjorsvik/smith/internal/types"
 )
@@ -24,7 +25,9 @@ func New(cfg Config) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(cfg.Server, "/"),
 		token:   cfg.Token,
-		http:    http.DefaultClient,
+		// A bounded timeout so the CLI can't hang forever on an unresponsive
+		// control plane (no per-request context is threaded for a short-lived CLI).
+		http: &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
