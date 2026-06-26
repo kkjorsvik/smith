@@ -22,6 +22,9 @@ type fakeCluster struct {
 	liveWorkloads []types.Workload
 	liveServices  []types.Service
 	liveIngresses []types.Ingress
+
+	listErr      error // returned by every List* call when set
+	failDeleteWl string // workload ID whose DeleteWorkload returns an error
 }
 
 func (f *fakeCluster) ApplyWorkload(w types.Workload) error {
@@ -40,11 +43,16 @@ func (f *fakeCluster) ApplyIngress(i types.Ingress) error {
 	f.calls = append(f.calls, "ingress:"+i.Host)
 	return nil
 }
-func (f *fakeCluster) ListWorkloads() ([]types.Workload, error) { return f.liveWorkloads, nil }
-func (f *fakeCluster) ListServices() ([]types.Service, error)   { return f.liveServices, nil }
-func (f *fakeCluster) ListIngresses() ([]types.Ingress, error)  { return f.liveIngresses, nil }
+func (f *fakeCluster) ListWorkloads() ([]types.Workload, error) {
+	return f.liveWorkloads, f.listErr
+}
+func (f *fakeCluster) ListServices() ([]types.Service, error)  { return f.liveServices, f.listErr }
+func (f *fakeCluster) ListIngresses() ([]types.Ingress, error) { return f.liveIngresses, f.listErr }
 func (f *fakeCluster) DeleteWorkload(id string) error {
 	f.calls = append(f.calls, "delete-workload:"+id)
+	if id == f.failDeleteWl {
+		return fmt.Errorf("delete denied")
+	}
 	return nil
 }
 func (f *fakeCluster) DeleteService(name string) error {
@@ -350,5 +358,28 @@ func TestApplyNoPruneKeepsExtras(t *testing.T) {
 		if strings.HasPrefix(c, "delete-") {
 			t.Errorf("apply without --prune deleted %q", c)
 		}
+	}
+}
+
+func TestApplyPruneDeleteErrorPropagates(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "alpha.yaml", alphaYAML)
+	fc := &fakeCluster{
+		liveWorkloads: []types.Workload{{ID: "alpha"}, {ID: "nginx-test"}},
+		failDeleteWl:  "nginx-test",
+	}
+	err := Apply(dir, fc, fakeDecryptor{}, false, true, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "prune workload nginx-test") || !strings.Contains(err.Error(), "delete denied") {
+		t.Fatalf("err = %v, want wrapped prune delete error", err)
+	}
+}
+
+func TestDiffListErrorPropagates(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "alpha.yaml", alphaYAML)
+	fc := &fakeCluster{listErr: errors.New("server down")}
+	err := Diff(dir, fc, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "list workloads") || !strings.Contains(err.Error(), "server down") {
+		t.Fatalf("err = %v, want wrapped list error", err)
 	}
 }

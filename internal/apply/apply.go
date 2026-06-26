@@ -218,17 +218,28 @@ func delta(desired, live []string) (create, del, inSync []string) {
 	return create, del, inSync
 }
 
-// pruneDrift deletes live resources not declared by the bundles, in
-// reverse-dependency order: ingresses, then services, then workloads.
-func pruneDrift(cluster Cluster, bundles []*bundle, out io.Writer) error {
+// prunePlan computes the live resource keys not declared by the bundles, per
+// kind. Both pruneDrift and printPrunePlan use it so the dry-run preview can
+// never diverge from what a real prune deletes.
+func prunePlan(cluster Cluster, bundles []*bundle) (delIng, delSvc, delWl []string, err error) {
 	dw, ds, di := desiredKeys(bundles)
 	lw, ls, li, err := liveKeys(cluster)
 	if err != nil {
+		return nil, nil, nil, err
+	}
+	_, delIng, _ = delta(di, li)
+	_, delSvc, _ = delta(ds, ls)
+	_, delWl, _ = delta(dw, lw)
+	return delIng, delSvc, delWl, nil
+}
+
+// pruneDrift deletes live resources not declared by the bundles, in
+// reverse-dependency order: ingresses, then services, then workloads.
+func pruneDrift(cluster Cluster, bundles []*bundle, out io.Writer) error {
+	delIng, delSvc, delWl, err := prunePlan(cluster, bundles)
+	if err != nil {
 		return err
 	}
-	_, delIng, _ := delta(di, li)
-	_, delSvc, _ := delta(ds, ls)
-	_, delWl, _ := delta(dw, lw)
 
 	for _, h := range delIng {
 		if err := cluster.DeleteIngress(h); err != nil {
@@ -253,14 +264,10 @@ func pruneDrift(cluster Cluster, bundles []*bundle, out io.Writer) error {
 
 // printPrunePlan prints the resources prune would delete, without deleting them.
 func printPrunePlan(cluster Cluster, bundles []*bundle, out io.Writer) error {
-	dw, ds, di := desiredKeys(bundles)
-	lw, ls, li, err := liveKeys(cluster)
+	delIng, delSvc, delWl, err := prunePlan(cluster, bundles)
 	if err != nil {
 		return err
 	}
-	_, delIng, _ := delta(di, li)
-	_, delSvc, _ := delta(ds, ls)
-	_, delWl, _ := delta(dw, lw)
 
 	fmt.Fprintln(out, "prune (dry run, nothing deleted):")
 	for _, h := range delIng {
