@@ -101,3 +101,76 @@ func TestApplyUnauthorized(t *testing.T) {
 		t.Errorf("error %q does not mention unauthorized", err)
 	}
 }
+
+func TestListWorkloads(t *testing.T) {
+	var gotMethod, gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[{"id":"postgres","image":"postgres:18"},{"id":"deployops","image":"deployops:1"}]`))
+	}))
+	defer srv.Close()
+
+	c := New(Config{Server: srv.URL, Token: "tok"})
+	ws, err := c.ListWorkloads()
+	if err != nil {
+		t.Fatalf("ListWorkloads: %v", err)
+	}
+	if gotMethod != "GET" || gotPath != "/workloads" {
+		t.Errorf("got %s %s, want GET /workloads", gotMethod, gotPath)
+	}
+	if gotAuth != "Bearer tok" {
+		t.Errorf("auth = %q", gotAuth)
+	}
+	if len(ws) != 2 || ws[0].ID != "postgres" || ws[1].ID != "deployops" {
+		t.Errorf("workloads = %+v", ws)
+	}
+}
+
+func TestListServicesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"boom"}`))
+	}))
+	defer srv.Close()
+	c := New(Config{Server: srv.URL, Token: "t"})
+	_, err := c.ListServices()
+	if err == nil || !strings.Contains(err.Error(), "500") || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want status+body", err)
+	}
+}
+
+func TestDeleteWorkload(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := New(Config{Server: srv.URL, Token: "t"})
+	if err := c.DeleteWorkload("nginx-test"); err != nil {
+		t.Fatalf("DeleteWorkload: %v", err)
+	}
+	if gotMethod != "DELETE" || gotPath != "/workloads/nginx-test" {
+		t.Errorf("got %s %s, want DELETE /workloads/nginx-test", gotMethod, gotPath)
+	}
+}
+
+func TestDeleteIngressEscapesAndErrors(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"missing"}`))
+	}))
+	defer srv.Close()
+	c := New(Config{Server: srv.URL, Token: "t"})
+	err := c.DeleteIngress("app.kkjorsvik.com")
+	if gotPath != "/ingresses/app.kkjorsvik.com" {
+		t.Errorf("path = %q, want /ingresses/app.kkjorsvik.com", gotPath)
+	}
+	if err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("err = %v, want 404 error", err)
+	}
+}

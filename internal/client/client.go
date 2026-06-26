@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -69,10 +70,96 @@ func (c *Client) post(path string, v any) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
+	return respError(path, resp)
+}
+
+// respError reads a non-2xx response body and folds the status into an error.
+func respError(path string, resp *http.Response) error {
 	respBody, _ := io.ReadAll(resp.Body)
 	msg := strings.TrimSpace(string(respBody))
 	if resp.StatusCode == http.StatusUnauthorized {
 		return fmt.Errorf("unauthorized (check token): %s", msg)
 	}
 	return fmt.Errorf("%s: %s: %s", path, resp.Status, msg)
+}
+
+// get issues an authenticated GET and decodes a 2xx JSON body into out.
+func (c *Client) get(path string, out any) error {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return respError(path, resp)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("%s: decode: %w", path, err)
+	}
+	return nil
+}
+
+// del issues an authenticated DELETE; any 2xx is success.
+func (c *Client) del(path string) error {
+	req, err := http.NewRequest(http.MethodDelete, c.baseURL+path, nil)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return respError(path, resp)
+}
+
+// ListWorkloads returns all workloads via GET /workloads.
+func (c *Client) ListWorkloads() ([]types.Workload, error) {
+	var out []types.Workload
+	if err := c.get("/workloads", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListServices returns all services via GET /services.
+func (c *Client) ListServices() ([]types.Service, error) {
+	var out []types.Service
+	if err := c.get("/services", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListIngresses returns all ingresses via GET /ingresses.
+func (c *Client) ListIngresses() ([]types.Ingress, error) {
+	var out []types.Ingress
+	if err := c.get("/ingresses", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DeleteWorkload removes a workload via DELETE /workloads/{id}.
+func (c *Client) DeleteWorkload(id string) error {
+	return c.del("/workloads/" + url.PathEscape(id))
+}
+
+// DeleteService removes a service via DELETE /services/{name}.
+func (c *Client) DeleteService(name string) error {
+	return c.del("/services/" + url.PathEscape(name))
+}
+
+// DeleteIngress removes an ingress via DELETE /ingresses/{host}.
+func (c *Client) DeleteIngress(host string) error {
+	return c.del("/ingresses/" + url.PathEscape(host))
 }
