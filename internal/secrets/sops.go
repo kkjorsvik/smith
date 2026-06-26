@@ -34,7 +34,10 @@ func (SopsDecryptor) Decrypt(path string) (map[string]string, error) {
 		if errors.Is(err, exec.ErrNotFound) {
 			return nil, fmt.Errorf("'sops' is not installed (PATH)")
 		}
-		return nil, fmt.Errorf("sops decrypt failed: %s", strings.TrimSpace(stderr.String()))
+		// err is an *exec.ExitError (exit status), never decrypted plaintext;
+		// sops writes plaintext to stdout, diagnostics to stderr. Including both
+		// keeps a diagnostic even when stderr is empty (e.g. a signal kill).
+		return nil, fmt.Errorf("sops decrypt %s: %w: %s", path, err, strings.TrimSpace(stderr.String()))
 	}
 	return parseOverlay(stdout.Bytes())
 }

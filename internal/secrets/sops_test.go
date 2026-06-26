@@ -17,6 +17,16 @@ func TestParseOverlayValid(t *testing.T) {
 	}
 }
 
+func TestParseOverlayEmpty(t *testing.T) {
+	env, err := parseOverlay([]byte("env: {}\n"))
+	if err != nil {
+		t.Fatalf("parseOverlay: %v", err)
+	}
+	if len(env) != 0 {
+		t.Errorf("env = %v, want empty", env)
+	}
+}
+
 func TestParseOverlayRejectsUnknownKey(t *testing.T) {
 	// The decrypted overlay must be an {env: map} document; anything else is a
 	// mistake we want surfaced.
