@@ -12,12 +12,16 @@ import (
 	"github.com/kkjorsvik/smith/internal/types"
 )
 
-// fakeCluster records the ordered apply calls and captures applied workloads so
-// tests can inspect merged env. It can be told to fail on a specific workload.
+// fakeCluster records apply/delete calls in order (deletes prefixed "delete-"),
+// captures applied workloads, and serves seeded "live" state for List*.
 type fakeCluster struct {
 	calls          []string
 	workloads      []types.Workload
 	failWorkloadID string
+
+	liveWorkloads []types.Workload
+	liveServices  []types.Service
+	liveIngresses []types.Ingress
 }
 
 func (f *fakeCluster) ApplyWorkload(w types.Workload) error {
@@ -34,6 +38,21 @@ func (f *fakeCluster) ApplyService(s types.Service) error {
 }
 func (f *fakeCluster) ApplyIngress(i types.Ingress) error {
 	f.calls = append(f.calls, "ingress:"+i.Host)
+	return nil
+}
+func (f *fakeCluster) ListWorkloads() ([]types.Workload, error) { return f.liveWorkloads, nil }
+func (f *fakeCluster) ListServices() ([]types.Service, error)   { return f.liveServices, nil }
+func (f *fakeCluster) ListIngresses() ([]types.Ingress, error)  { return f.liveIngresses, nil }
+func (f *fakeCluster) DeleteWorkload(id string) error {
+	f.calls = append(f.calls, "delete-workload:"+id)
+	return nil
+}
+func (f *fakeCluster) DeleteService(name string) error {
+	f.calls = append(f.calls, "delete-service:"+name)
+	return nil
+}
+func (f *fakeCluster) DeleteIngress(host string) error {
+	f.calls = append(f.calls, "delete-ingress:"+host)
 	return nil
 }
 
@@ -86,7 +105,7 @@ func TestApplyOrdering(t *testing.T) {
 
 	fc := &fakeCluster{}
 	var out bytes.Buffer
-	if err := Apply(dir, fc, fakeDecryptor{}, false, &out); err != nil {
+	if err := Apply(dir, fc, fakeDecryptor{}, false, false, &out); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	want := "workload:alpha,workload:beta,service:alpha,ingress:alpha.example.com"
@@ -103,7 +122,7 @@ func TestApplyValidateAllAborts(t *testing.T) {
 	writeManifest(t, dir, "good.yaml", betaYAML)
 	writeManifest(t, dir, "bad.yaml", "name: bad\nworkload: {}\n") // missing image
 	fc := &fakeCluster{}
-	err := Apply(dir, fc, fakeDecryptor{}, false, &bytes.Buffer{})
+	err := Apply(dir, fc, fakeDecryptor{}, false, false, &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -118,7 +137,7 @@ func TestApplyDryRun(t *testing.T) {
 
 	fc := &fakeCluster{}
 	var out bytes.Buffer
-	if err := Apply(dir, fc, fakeDecryptor{}, true, &out); err != nil {
+	if err := Apply(dir, fc, fakeDecryptor{}, true, false, &out); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if len(fc.calls) != 0 {
@@ -139,7 +158,7 @@ func TestApplyFailFast(t *testing.T) {
 	writeManifest(t, dir, "alpha.yaml", alphaYAML)
 	writeManifest(t, dir, "beta.yaml", betaYAML)
 	fc := &fakeCluster{failWorkloadID: "beta"}
-	err := Apply(dir, fc, fakeDecryptor{}, false, &bytes.Buffer{})
+	err := Apply(dir, fc, fakeDecryptor{}, false, false, &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -153,14 +172,14 @@ func TestApplyFailFast(t *testing.T) {
 func TestApplyNoManifests(t *testing.T) {
 	dir := t.TempDir()
 	writeManifest(t, dir, "only.sops.yaml", "env: {}\n")
-	err := Apply(dir, &fakeCluster{}, fakeDecryptor{}, false, &bytes.Buffer{})
+	err := Apply(dir, &fakeCluster{}, fakeDecryptor{}, false, false, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "no manifests found") {
 		t.Fatalf("err = %v, want 'no manifests found'", err)
 	}
 }
 
 func TestApplyMissingDir(t *testing.T) {
-	err := Apply(filepath.Join(t.TempDir(), "nope"), &fakeCluster{}, fakeDecryptor{}, false, &bytes.Buffer{})
+	err := Apply(filepath.Join(t.TempDir(), "nope"), &fakeCluster{}, fakeDecryptor{}, false, false, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "read dir") {
 		t.Fatalf("err = %v, want 'read dir'", err)
 	}
@@ -169,18 +188,18 @@ func TestApplyMissingDir(t *testing.T) {
 func TestApplyMergesOverlay(t *testing.T) {
 	dir := t.TempDir()
 	writeManifest(t, dir, "gamma.yaml", gammaYAML)
-	writeManifest(t, dir, "gamma.sops.yaml", "encrypted-bytes\n") // content ignored by fake
+	writeManifest(t, dir, "gamma.sops.yaml", "encrypted-bytes\n")
 	dec := fakeDecryptor{env: map[string]string{"DB_PASSWORD": "realsecret", "API_KEY": "k"}}
 
 	fc := &fakeCluster{}
-	if err := Apply(dir, fc, dec, false, &bytes.Buffer{}); err != nil {
+	if err := Apply(dir, fc, dec, false, false, &bytes.Buffer{}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if len(fc.workloads) != 1 {
 		t.Fatalf("got %d workloads, want 1", len(fc.workloads))
 	}
 	env := fc.workloads[0].Env
-	if env["DB_PASSWORD"] != "realsecret" { // overlay wins over the placeholder
+	if env["DB_PASSWORD"] != "realsecret" {
 		t.Errorf("DB_PASSWORD = %q, want realsecret (overlay should win)", env["DB_PASSWORD"])
 	}
 	if env["API_KEY"] != "k" {
@@ -198,7 +217,7 @@ func TestApplyOverlayDecryptErrorAborts(t *testing.T) {
 	dec := fakeDecryptor{err: errors.New("bad key")}
 
 	fc := &fakeCluster{}
-	err := Apply(dir, fc, dec, false, &bytes.Buffer{})
+	err := Apply(dir, fc, dec, false, false, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "bad key") {
 		t.Fatalf("err = %v, want decrypt error", err)
 	}
@@ -215,11 +234,8 @@ func TestApplyDryRunRedactsOverlay(t *testing.T) {
 
 	fc := &fakeCluster{}
 	var out bytes.Buffer
-	if err := Apply(dir, fc, dec, true, &out); err != nil {
+	if err := Apply(dir, fc, dec, true, false, &out); err != nil {
 		t.Fatalf("Apply: %v", err)
-	}
-	if len(fc.calls) != 0 {
-		t.Errorf("dry run applied resources: %v", fc.calls)
 	}
 	if strings.Contains(out.String(), "realsecret") {
 		t.Errorf("dry-run output leaked secret value:\n%s", out.String())
@@ -235,15 +251,104 @@ func TestApplyDryRunRedactsOverlay(t *testing.T) {
 func TestApplyOrphanOverlayIgnored(t *testing.T) {
 	dir := t.TempDir()
 	writeManifest(t, dir, "beta.yaml", betaYAML)
-	writeManifest(t, dir, "orphan.sops.yaml", "env:\n  X: y\n") // no orphan.yaml bundle
-	// Decryptor would error if called, proving the orphan is never decrypted.
+	writeManifest(t, dir, "orphan.sops.yaml", "env:\n  X: y\n")
 	dec := fakeDecryptor{err: errors.New("should not be called")}
 
 	fc := &fakeCluster{}
-	if err := Apply(dir, fc, dec, false, &bytes.Buffer{}); err != nil {
+	if err := Apply(dir, fc, dec, false, false, &bytes.Buffer{}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if strings.Join(fc.calls, ",") != "workload:beta" {
 		t.Errorf("calls = %v, want only workload:beta", fc.calls)
+	}
+}
+
+func TestDelta(t *testing.T) {
+	create, del, inSync := delta([]string{"a", "b", "c"}, []string{"b", "c", "d"})
+	if strings.Join(create, ",") != "a" {
+		t.Errorf("create = %v, want [a]", create)
+	}
+	if strings.Join(del, ",") != "d" {
+		t.Errorf("del = %v, want [d]", del)
+	}
+	if strings.Join(inSync, ",") != "b,c" {
+		t.Errorf("inSync = %v, want [b c]", inSync)
+	}
+}
+
+func TestDiff(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "alpha.yaml", alphaYAML)
+	writeManifest(t, dir, "beta.yaml", betaYAML) // git-only -> create
+	fc := &fakeCluster{
+		liveWorkloads: []types.Workload{{ID: "alpha"}, {ID: "nginx-test"}}, // nginx-test live-only -> delete
+		liveServices:  []types.Service{{Name: "alpha"}},
+		liveIngresses: []types.Ingress{{Host: "alpha.example.com"}},
+	}
+	var out bytes.Buffer
+	if err := Diff(dir, fc, &out); err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	s := out.String()
+	for _, want := range []string{"+ create   beta", "- delete   nginx-test", "= in sync  alpha"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("diff output missing %q; got:\n%s", want, s)
+		}
+	}
+	if len(fc.calls) != 0 {
+		t.Errorf("diff must be read-only, recorded %v", fc.calls)
+	}
+}
+
+func TestApplyPruneDeletesDriftInOrder(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "alpha.yaml", alphaYAML)
+	fc := &fakeCluster{
+		liveWorkloads: []types.Workload{{ID: "alpha"}, {ID: "nginx-test"}},
+		liveServices:  []types.Service{{Name: "alpha"}, {Name: "nginx-test"}},
+		liveIngresses: []types.Ingress{{Host: "alpha.example.com"}, {Host: "old.example.com"}},
+	}
+	var out bytes.Buffer
+	if err := Apply(dir, fc, fakeDecryptor{}, false, true, &out); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	want := "workload:alpha,service:alpha,ingress:alpha.example.com," +
+		"delete-ingress:old.example.com,delete-service:nginx-test,delete-workload:nginx-test"
+	if strings.Join(fc.calls, ",") != want {
+		t.Errorf("calls = %v\nwant %v", fc.calls, want)
+	}
+}
+
+func TestApplyPruneDryRun(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "alpha.yaml", alphaYAML)
+	fc := &fakeCluster{
+		liveWorkloads: []types.Workload{{ID: "alpha"}, {ID: "nginx-test"}},
+	}
+	var out bytes.Buffer
+	if err := Apply(dir, fc, fakeDecryptor{}, true, true, &out); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(fc.calls) != 0 {
+		t.Errorf("dry-run prune must not apply or delete, recorded %v", fc.calls)
+	}
+	if !strings.Contains(out.String(), "delete workload nginx-test") {
+		t.Errorf("prune dry-run missing the would-delete line:\n%s", out.String())
+	}
+}
+
+func TestApplyNoPruneKeepsExtras(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "alpha.yaml", alphaYAML)
+	fc := &fakeCluster{
+		liveWorkloads: []types.Workload{{ID: "alpha"}, {ID: "nginx-test"}},
+	}
+	if err := Apply(dir, fc, fakeDecryptor{}, false, false, &bytes.Buffer{}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	for _, c := range fc.calls {
+		if strings.HasPrefix(c, "delete-") {
+			t.Errorf("apply without --prune deleted %q", c)
+		}
 	}
 }

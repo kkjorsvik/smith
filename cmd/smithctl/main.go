@@ -1,5 +1,5 @@
 // Command smithctl is the smith operator CLI. It resolves a directory of GitOps
-// app bundles and applies the resulting resources to the control-plane API.
+// app bundles and applies (or diffs/prunes) them against the control-plane API.
 package main
 
 import (
@@ -13,7 +13,7 @@ import (
 	"github.com/kkjorsvik/smith/internal/secrets"
 )
 
-const usage = "usage: smithctl [--config PATH] apply [--dry-run] <dir>"
+const usage = "usage: smithctl [--config PATH] <apply|diff> [flags] <dir>"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -35,6 +35,8 @@ func run(args []string) error {
 	switch rest[0] {
 	case "apply":
 		return runApply(*configPath, rest[1:])
+	case "diff":
+		return runDiff(*configPath, rest[1:])
 	default:
 		return fmt.Errorf("unknown command %q\n%s", rest[0], usage)
 	}
@@ -43,24 +45,43 @@ func run(args []string) error {
 func runApply(configPath string, args []string) error {
 	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
 	dryRun := fs.Bool("dry-run", false, "validate and print a plan without applying")
+	prune := fs.Bool("prune", false, "delete live resources not declared in <dir>")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: smithctl apply [--dry-run] <dir>")
+		return errors.New("usage: smithctl apply [--dry-run] [--prune] <dir>")
 	}
-	dir := fs.Arg(0)
-
-	if configPath == "" {
-		p, err := client.DefaultConfigPath()
-		if err != nil {
-			return err
-		}
-		configPath = p
-	}
-	cfg, err := client.LoadConfig(configPath)
+	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return err
 	}
-	return apply.Apply(dir, client.New(cfg), secrets.SopsDecryptor{}, *dryRun, os.Stdout)
+	return apply.Apply(fs.Arg(0), client.New(cfg), secrets.SopsDecryptor{}, *dryRun, *prune, os.Stdout)
+}
+
+func runDiff(configPath string, args []string) error {
+	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: smithctl diff <dir>")
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	return apply.Diff(fs.Arg(0), client.New(cfg), os.Stdout)
+}
+
+// loadConfig resolves the config path (defaulting when empty) and loads it.
+func loadConfig(configPath string) (client.Config, error) {
+	if configPath == "" {
+		p, err := client.DefaultConfigPath()
+		if err != nil {
+			return client.Config{}, err
+		}
+		configPath = p
+	}
+	return client.LoadConfig(configPath)
 }

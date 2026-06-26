@@ -1,7 +1,8 @@
 // Package apply orchestrates GitOps app bundles: it reads a directory of
 // manifests, validates every one (merging any sibling <app>.sops.yaml secret
-// overlay) before touching the cluster, then applies the resolved workloads,
-// services, and ingresses through a Cluster interface.
+// overlay), and applies the resolved workloads, services, and ingresses through
+// a Cluster interface. It can also diff against, and prune drift from, live
+// cluster state.
 package apply
 
 import (
@@ -16,12 +17,18 @@ import (
 	"github.com/kkjorsvik/smith/internal/types"
 )
 
-// Cluster is the subset of the control-plane API apply needs: it creates or
-// updates the three GitOps resource kinds.
+// Cluster is the subset of the control-plane API apply needs: apply, list, and
+// delete for the three GitOps resource kinds.
 type Cluster interface {
 	ApplyWorkload(types.Workload) error
 	ApplyService(types.Service) error
 	ApplyIngress(types.Ingress) error
+	ListWorkloads() ([]types.Workload, error)
+	ListServices() ([]types.Service, error)
+	ListIngresses() ([]types.Ingress, error)
+	DeleteWorkload(id string) error
+	DeleteService(name string) error
+	DeleteIngress(host string) error
 }
 
 // Decryptor decrypts a SOPS-encrypted overlay file into its env map. The real
@@ -30,50 +37,66 @@ type Decryptor interface {
 	Decrypt(path string) (map[string]string, error)
 }
 
-// bundle pairs a resolved manifest with the env keys that came from its
-// decrypted secret overlay, so a dry run can redact those values.
+// bundle pairs a resolved manifest with its source file and the env keys that
+// came from its decrypted secret overlay (for dry-run redaction).
 type bundle struct {
+	file        string
 	res         *manifest.Resolved
 	overlayKeys map[string]bool
 }
 
-// Apply reads every manifest in dir, resolves and validates them all (merging
-// any sibling <app>.sops.yaml secret overlay into the workload env), and then
-// (unless dryRun) applies all workloads, then all services, then all ingresses.
-// Validation is all-or-nothing: if any manifest is invalid or any overlay fails
-// to decrypt, nothing is applied.
-func Apply(dir string, cluster Cluster, dec Decryptor, dryRun bool, out io.Writer) error {
+// loadBundles reads, parses, and resolves every manifest in dir. It does not
+// merge secret overlays (callers that need them do so separately).
+func loadBundles(dir string) ([]*bundle, error) {
 	files, err := manifestFiles(dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(files) == 0 {
-		return fmt.Errorf("no manifests found in %s", dir)
+		return nil, fmt.Errorf("no manifests found in %s", dir)
 	}
-
 	var bundles []*bundle
 	for _, file := range files {
 		data, err := os.ReadFile(file)
 		if err != nil {
-			return fmt.Errorf("%s: %w", file, err)
+			return nil, fmt.Errorf("%s: %w", file, err)
 		}
 		app, err := manifest.Parse(data)
 		if err != nil {
-			return fmt.Errorf("%s: %w", file, err)
+			return nil, fmt.Errorf("%s: %w", file, err)
 		}
 		res, err := app.Resolve()
 		if err != nil {
-			return fmt.Errorf("%s: %w", file, err)
+			return nil, fmt.Errorf("%s: %w", file, err)
 		}
-		overlayKeys, err := mergeOverlay(file, res, dec)
+		bundles = append(bundles, &bundle{file: file, res: res})
+	}
+	return bundles, nil
+}
+
+// Apply resolves every manifest in dir (merging any sibling secret overlay) and,
+// unless dryRun, applies all workloads, then services, then ingresses. When
+// prune is set it then deletes live resources not declared in dir, in
+// reverse-dependency order. Validation is all-or-nothing: if any manifest is
+// invalid or any overlay fails to decrypt, nothing is applied.
+func Apply(dir string, cluster Cluster, dec Decryptor, dryRun, prune bool, out io.Writer) error {
+	bundles, err := loadBundles(dir)
+	if err != nil {
+		return err
+	}
+	for _, b := range bundles {
+		keys, err := mergeOverlay(b.file, b.res, dec)
 		if err != nil {
 			return err
 		}
-		bundles = append(bundles, &bundle{res: res, overlayKeys: overlayKeys})
+		b.overlayKeys = keys
 	}
 
 	if dryRun {
 		printPlan(out, bundles)
+		if prune {
+			return printPrunePlan(cluster, bundles, out)
+		}
 		return nil
 	}
 
@@ -99,7 +122,172 @@ func Apply(dir string, cluster Cluster, dec Decryptor, dryRun bool, out io.Write
 			fmt.Fprintf(out, "applied ingress %s\n", in.Host)
 		}
 	}
+
+	if prune {
+		return pruneDrift(cluster, bundles, out)
+	}
 	return nil
+}
+
+// Diff resolves the manifests in dir and prints the create/delete/in-sync delta
+// against live cluster state, by resource identity. It is read-only and does not
+// decrypt secret overlays (it compares identities, not env contents).
+func Diff(dir string, cluster Cluster, out io.Writer) error {
+	bundles, err := loadBundles(dir)
+	if err != nil {
+		return err
+	}
+	dw, ds, di := desiredKeys(bundles)
+	lw, ls, li, err := liveKeys(cluster)
+	if err != nil {
+		return err
+	}
+	printDiff(out, "workloads", dw, lw)
+	printDiff(out, "services", ds, ls)
+	printDiff(out, "ingresses", di, li)
+	return nil
+}
+
+// desiredKeys returns the workload IDs, service names, and ingress hosts the
+// bundles declare.
+func desiredKeys(bundles []*bundle) (workloads, services, ingresses []string) {
+	for _, b := range bundles {
+		workloads = append(workloads, b.res.Workload.ID)
+		for _, s := range b.res.Services {
+			services = append(services, s.Name)
+		}
+		for _, in := range b.res.Ingresses {
+			ingresses = append(ingresses, in.Host)
+		}
+	}
+	return workloads, services, ingresses
+}
+
+// liveKeys lists the live resource keys from the cluster.
+func liveKeys(cluster Cluster) (workloads, services, ingresses []string, err error) {
+	ws, err := cluster.ListWorkloads()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("list workloads: %w", err)
+	}
+	ss, err := cluster.ListServices()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("list services: %w", err)
+	}
+	is, err := cluster.ListIngresses()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("list ingresses: %w", err)
+	}
+	for _, w := range ws {
+		workloads = append(workloads, w.ID)
+	}
+	for _, s := range ss {
+		services = append(services, s.Name)
+	}
+	for _, in := range is {
+		ingresses = append(ingresses, in.Host)
+	}
+	return workloads, services, ingresses, nil
+}
+
+// delta partitions desired and live keys into create (desired-only), del
+// (live-only), and inSync (in both). All results are sorted.
+func delta(desired, live []string) (create, del, inSync []string) {
+	desiredSet := make(map[string]bool, len(desired))
+	for _, k := range desired {
+		desiredSet[k] = true
+	}
+	liveSet := make(map[string]bool, len(live))
+	for _, k := range live {
+		liveSet[k] = true
+	}
+	for _, k := range desired {
+		if liveSet[k] {
+			inSync = append(inSync, k)
+		} else {
+			create = append(create, k)
+		}
+	}
+	for _, k := range live {
+		if !desiredSet[k] {
+			del = append(del, k)
+		}
+	}
+	sort.Strings(create)
+	sort.Strings(del)
+	sort.Strings(inSync)
+	return create, del, inSync
+}
+
+// pruneDrift deletes live resources not declared by the bundles, in
+// reverse-dependency order: ingresses, then services, then workloads.
+func pruneDrift(cluster Cluster, bundles []*bundle, out io.Writer) error {
+	dw, ds, di := desiredKeys(bundles)
+	lw, ls, li, err := liveKeys(cluster)
+	if err != nil {
+		return err
+	}
+	_, delIng, _ := delta(di, li)
+	_, delSvc, _ := delta(ds, ls)
+	_, delWl, _ := delta(dw, lw)
+
+	for _, h := range delIng {
+		if err := cluster.DeleteIngress(h); err != nil {
+			return fmt.Errorf("prune ingress %s: %w", h, err)
+		}
+		fmt.Fprintf(out, "pruned ingress %s\n", h)
+	}
+	for _, n := range delSvc {
+		if err := cluster.DeleteService(n); err != nil {
+			return fmt.Errorf("prune service %s: %w", n, err)
+		}
+		fmt.Fprintf(out, "pruned service %s\n", n)
+	}
+	for _, id := range delWl {
+		if err := cluster.DeleteWorkload(id); err != nil {
+			return fmt.Errorf("prune workload %s: %w", id, err)
+		}
+		fmt.Fprintf(out, "pruned workload %s\n", id)
+	}
+	return nil
+}
+
+// printPrunePlan prints the resources prune would delete, without deleting them.
+func printPrunePlan(cluster Cluster, bundles []*bundle, out io.Writer) error {
+	dw, ds, di := desiredKeys(bundles)
+	lw, ls, li, err := liveKeys(cluster)
+	if err != nil {
+		return err
+	}
+	_, delIng, _ := delta(di, li)
+	_, delSvc, _ := delta(ds, ls)
+	_, delWl, _ := delta(dw, lw)
+
+	fmt.Fprintln(out, "prune (dry run, nothing deleted):")
+	for _, h := range delIng {
+		fmt.Fprintf(out, "  - delete ingress %s\n", h)
+	}
+	for _, n := range delSvc {
+		fmt.Fprintf(out, "  - delete service %s\n", n)
+	}
+	for _, id := range delWl {
+		fmt.Fprintf(out, "  - delete workload %s\n", id)
+	}
+	return nil
+}
+
+// printDiff prints one kind's create/delete/in-sync delta.
+func printDiff(out io.Writer, kind string, desired, live []string) {
+	create, del, inSync := delta(desired, live)
+	fmt.Fprintf(out, "%s:\n", kind)
+	for _, k := range create {
+		fmt.Fprintf(out, "  + create   %s\n", k)
+	}
+	for _, k := range del {
+		fmt.Fprintf(out, "  - delete   %s\n", k)
+	}
+	if len(inSync) > 0 {
+		fmt.Fprintf(out, "  = in sync  %s\n", strings.Join(inSync, ", "))
+	}
 }
 
 // mergeOverlay looks for a sibling <base>.sops.yaml next to the bundle file; if
