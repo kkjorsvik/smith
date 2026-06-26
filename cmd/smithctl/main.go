@@ -10,6 +10,7 @@ import (
 
 	"github.com/kkjorsvik/smith/internal/apply"
 	"github.com/kkjorsvik/smith/internal/client"
+	"github.com/kkjorsvik/smith/internal/secrets"
 )
 
 const usage = "usage: smithctl [--config PATH] apply [--dry-run] <dir>"
@@ -61,5 +62,5 @@ func runApply(configPath string, args []string) error {
 	if err != nil {
 		return err
 	}
-	return apply.Apply(dir, client.New(cfg), *dryRun, os.Stdout)
+	return apply.Apply(dir, client.New(cfg), secrets.SopsDecryptor{}, *dryRun, os.Stdout)
 }

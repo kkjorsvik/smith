@@ -1,6 +1,7 @@
 // Package apply orchestrates GitOps app bundles: it reads a directory of
-// manifests, validates every one before touching the cluster, then applies the
-// resolved workloads, services, and ingresses through a Cluster interface.
+// manifests, validates every one (merging any sibling <app>.sops.yaml secret
+// overlay) before touching the cluster, then applies the resolved workloads,
+// services, and ingresses through a Cluster interface.
 package apply
 
 import (
@@ -23,10 +24,25 @@ type Cluster interface {
 	ApplyIngress(types.Ingress) error
 }
 
-// Apply reads every manifest in dir, resolves and validates them all, and then
+// Decryptor decrypts a SOPS-encrypted overlay file into its env map. The real
+// implementation is internal/secrets.SopsDecryptor; tests use a fake.
+type Decryptor interface {
+	Decrypt(path string) (map[string]string, error)
+}
+
+// bundle pairs a resolved manifest with the env keys that came from its
+// decrypted secret overlay, so a dry run can redact those values.
+type bundle struct {
+	res         *manifest.Resolved
+	overlayKeys map[string]bool
+}
+
+// Apply reads every manifest in dir, resolves and validates them all (merging
+// any sibling <app>.sops.yaml secret overlay into the workload env), and then
 // (unless dryRun) applies all workloads, then all services, then all ingresses.
-// Validation is all-or-nothing: if any manifest is invalid, nothing is applied.
-func Apply(dir string, cluster Cluster, dryRun bool, out io.Writer) error {
+// Validation is all-or-nothing: if any manifest is invalid or any overlay fails
+// to decrypt, nothing is applied.
+func Apply(dir string, cluster Cluster, dec Decryptor, dryRun bool, out io.Writer) error {
 	files, err := manifestFiles(dir)
 	if err != nil {
 		return err
@@ -35,7 +51,7 @@ func Apply(dir string, cluster Cluster, dryRun bool, out io.Writer) error {
 		return fmt.Errorf("no manifests found in %s", dir)
 	}
 
-	var resolved []*manifest.Resolved
+	var bundles []*bundle
 	for _, file := range files {
 		data, err := os.ReadFile(file)
 		if err != nil {
@@ -49,30 +65,34 @@ func Apply(dir string, cluster Cluster, dryRun bool, out io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", file, err)
 		}
-		resolved = append(resolved, res)
+		overlayKeys, err := mergeOverlay(file, res, dec)
+		if err != nil {
+			return err
+		}
+		bundles = append(bundles, &bundle{res: res, overlayKeys: overlayKeys})
 	}
 
 	if dryRun {
-		printPlan(out, resolved)
+		printPlan(out, bundles)
 		return nil
 	}
 
-	for _, r := range resolved {
-		if err := cluster.ApplyWorkload(r.Workload); err != nil {
-			return fmt.Errorf("workload %s: %w", r.Workload.ID, err)
+	for _, b := range bundles {
+		if err := cluster.ApplyWorkload(b.res.Workload); err != nil {
+			return fmt.Errorf("workload %s: %w", b.res.Workload.ID, err)
 		}
-		fmt.Fprintf(out, "applied workload %s\n", r.Workload.ID)
+		fmt.Fprintf(out, "applied workload %s\n", b.res.Workload.ID)
 	}
-	for _, r := range resolved {
-		for _, s := range r.Services {
+	for _, b := range bundles {
+		for _, s := range b.res.Services {
 			if err := cluster.ApplyService(s); err != nil {
 				return fmt.Errorf("service %s: %w", s.Name, err)
 			}
 			fmt.Fprintf(out, "applied service %s\n", s.Name)
 		}
 	}
-	for _, r := range resolved {
-		for _, in := range r.Ingresses {
+	for _, b := range bundles {
+		for _, in := range b.res.Ingresses {
 			if err := cluster.ApplyIngress(in); err != nil {
 				return fmt.Errorf("ingress %s: %w", in.Host, err)
 			}
@@ -80,6 +100,35 @@ func Apply(dir string, cluster Cluster, dryRun bool, out io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// mergeOverlay looks for a sibling <base>.sops.yaml next to the bundle file; if
+// present it decrypts it and merges its env over the workload env (overlay
+// wins). It returns the set of keys that came from the overlay (for dry-run
+// redaction), or nil if there is no overlay.
+func mergeOverlay(bundleFile string, res *manifest.Resolved, dec Decryptor) (map[string]bool, error) {
+	overlayPath := strings.TrimSuffix(bundleFile, ".yaml") + ".sops.yaml"
+	if _, err := os.Stat(overlayPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("%s: stat overlay: %w", res.Workload.ID, err)
+	}
+
+	env, err := dec.Decrypt(overlayPath)
+	if err != nil {
+		return nil, fmt.Errorf("%s: decrypt %s: %w", res.Workload.ID, overlayPath, err)
+	}
+
+	if res.Workload.Env == nil {
+		res.Workload.Env = make(map[string]string, len(env))
+	}
+	keys := make(map[string]bool, len(env))
+	for k, v := range env {
+		res.Workload.Env[k] = v // overlay wins
+		keys[k] = true
+	}
+	return keys, nil
 }
 
 // manifestFiles returns the sorted list of *.yaml files in dir, excluding
@@ -105,20 +154,39 @@ func manifestFiles(dir string) ([]string, error) {
 }
 
 // printPlan writes a human-readable dry-run summary of what would be applied.
-func printPlan(out io.Writer, resolved []*manifest.Resolved) {
+// Workload env is shown with overlay-sourced keys redacted so secret values are
+// never printed.
+func printPlan(out io.Writer, bundles []*bundle) {
 	fmt.Fprintln(out, "plan (dry run, nothing applied):")
-	for _, r := range resolved {
-		w := r.Workload
+	for _, b := range bundles {
+		w := b.res.Workload
 		fmt.Fprintf(out, "  workload %s  image=%s replicas=%d\n", w.ID, w.Image, w.Replicas)
+		for _, k := range sortedKeys(w.Env) {
+			if b.overlayKeys[k] {
+				fmt.Fprintf(out, "    env %s=(set from overlay)\n", k)
+			} else {
+				fmt.Fprintf(out, "    env %s=%s\n", k, w.Env[k])
+			}
+		}
 	}
-	for _, r := range resolved {
-		for _, s := range r.Services {
+	for _, b := range bundles {
+		for _, s := range b.res.Services {
 			fmt.Fprintf(out, "  service %s  port=%d nodePort=%d\n", s.Name, s.Port, s.NodePort)
 		}
 	}
-	for _, r := range resolved {
-		for _, in := range r.Ingresses {
+	for _, b := range bundles {
+		for _, in := range b.res.Ingresses {
 			fmt.Fprintf(out, "  ingress %s -> service %s\n", in.Host, in.Service)
 		}
 	}
+}
+
+// sortedKeys returns the keys of m in sorted order for deterministic output.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
