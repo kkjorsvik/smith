@@ -763,9 +763,12 @@ interval after a server restart, with no agent intervention.
 - **Hostnames, not IPs.** Because of mTLS SAN verification, agents must be
   addressed by the hostnames their certs were issued for. See the warning in
   [cert generation](#mtls-generating-certificates).
-- **Hardcoded names/paths.** `smith-server-01.kkjorsvik.com`, `/etc/smith`,
-  `/var/lib/smith`, and the intervals are fixed in source today; adjust there if
-  your environment differs.
+- **Domain config.** The public hostname defaults to `smith-server-01.kkjorsvik.com`
+  and the ingress wildcard zone to `kkjorsvik.com`; override them with
+  `SMITH_PUBLIC_DOMAIN` and `SMITH_INGRESS_DOMAIN` (e.g. in `/etc/smith/server.env`),
+  and pass `gencerts -domain` to match the server cert SAN.
+- **Hardcoded paths.** `/etc/smith`, `/var/lib/smith`, and the reconcile/heartbeat
+  intervals are fixed in source today; adjust there if your environment differs.
 - **Health checks are defined but not yet wired into reconciliation.** Workloads
   accept a `health_check`, and the control plane has a `health.Monitor` that can
   run `http`/`exec` probes, but the reconcile loop does not currently start

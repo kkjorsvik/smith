@@ -146,6 +146,7 @@ func runGenCerts() {
 	fs := flag.NewFlagSet("gencerts", flag.ExitOnError)
 	out := fs.String("out", "/etc/smith/certs", "Directory to write certs into")
 	hosts := fs.String("hosts", "", "Comma-separated list of agent hostnames/IPs to generate certs for")
+	domain := fs.String("domain", api.PublicDomain(), "Public hostname for the server cert CN/SAN (also settable via SMITH_PUBLIC_DOMAIN)")
 	forceCA := fs.Bool("force-ca", false, "Regenerate the CA even if one exists (DESTRUCTIVE: re-keys the whole cluster)")
 	fs.Parse(os.Args[2:])
 
@@ -155,8 +156,10 @@ func runGenCerts() {
 
 	caCert, caKey := loadOrCreateCA(*out, *forceCA)
 
-	// Issue/refresh the server cert against the CA in force.
-	generateCert(*out, "server", caCert, caKey, []string{"smith-server-01.kkjorsvik.com"})
+	// Issue/refresh the server cert against the CA in force. The SAN must match
+	// the public domain the server provisions its :443 cert for (see
+	// api.PublicDomain).
+	generateCert(*out, "server", caCert, caKey, []string{*domain})
 
 	// Issue/refresh agent certs.
 	for _, host := range splitHosts(*hosts) {

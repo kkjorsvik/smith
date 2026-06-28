@@ -202,16 +202,42 @@ func (s *Server) Start() {
 
 const (
 	autocertDir      = "/var/lib/smith/autocert"
-	wildcardDomain   = "*.kkjorsvik.com"
-	wildcardZone     = "kkjorsvik.com"
 	wildcardCertFile = autocertDir + "/wildcard.crt"
 	wildcardKeyFile  = autocertDir + "/wildcard.key"
+
+	// DefaultPublicDomain is the control plane's public hostname (the :443 cert
+	// CN/SAN and ACME order domain) when SMITH_PUBLIC_DOMAIN is unset.
+	DefaultPublicDomain = "smith-server-01.kkjorsvik.com"
+	// defaultIngressZone is the base domain for the ingress wildcard cert and
+	// its Route 53 hosted-zone lookup when SMITH_INGRESS_DOMAIN is unset. The
+	// wildcard cert is issued for "*.<zone>".
+	defaultIngressZone = "kkjorsvik.com"
 )
+
+// PublicDomain returns the control plane's public hostname (the :443 cert
+// CN/SAN and ACME order domain), overridable via SMITH_PUBLIC_DOMAIN. It is
+// exported so the gencerts command issues the server cert for the same name.
+func PublicDomain() string {
+	if d := strings.TrimSpace(os.Getenv("SMITH_PUBLIC_DOMAIN")); d != "" {
+		return d
+	}
+	return DefaultPublicDomain
+}
+
+// ingressZone returns the base domain for the ingress wildcard cert (issued for
+// "*.<zone>", with the Route 53 hosted-zone lookup keyed on "<zone>"),
+// overridable via SMITH_INGRESS_DOMAIN.
+func ingressZone() string {
+	if d := strings.TrimSpace(os.Getenv("SMITH_INGRESS_DOMAIN")); d != "" {
+		return d
+	}
+	return defaultIngressZone
+}
 
 // provisionCert obtains or loads a cached TLS cert for the server's
 // public hostname using ACME DNS-01 via Route 53.
 func (s *Server) provisionCert() (*tls.Config, error) {
-	const domain = "smith-server-01.kkjorsvik.com"
+	domain := PublicDomain()
 	certFile := autocertDir + "/server.crt"
 	keyFile := autocertDir + "/server.key"
 
@@ -236,15 +262,17 @@ func (s *Server) provisionCert() (*tls.Config, error) {
 // ingress proxies. Best-effort: a failure just leaves ingress TLS unavailable
 // (agents skip ingress) rather than blocking the control plane.
 func (s *Server) ensureWildcardCert() {
+	zone := ingressZone()
+	wildcard := "*." + zone
 	if _, err := os.Stat(wildcardCertFile); err == nil {
-		log.Printf("api: wildcard cert cached for %s", wildcardDomain)
+		log.Printf("api: wildcard cert cached for %s", wildcard)
 		return
 	}
-	if err := obtainCert(wildcardDomain, wildcardZone, wildcardCertFile, wildcardKeyFile); err != nil {
+	if err := obtainCert(wildcard, zone, wildcardCertFile, wildcardKeyFile); err != nil {
 		log.Printf("api: provision wildcard cert failed (ingress TLS unavailable): %v", err)
 		return
 	}
-	log.Printf("api: wildcard cert provisioned for %s", wildcardDomain)
+	log.Printf("api: wildcard cert provisioned for %s", wildcard)
 }
 
 // obtainCert runs the ACME DNS-01 (Route 53) flow for orderDomain and caches
