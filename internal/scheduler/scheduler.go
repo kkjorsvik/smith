@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/kkjorsvik/smith/internal/registry"
@@ -50,12 +51,19 @@ func (s *Scheduler) Assign(replicaID, parentID string, req types.Resources) (typ
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Already assigned — sticky. Refresh the recorded request so accounting
-	// stays current across spec changes (e.g. a rolling update that altered
-	// resources), without moving the running replica.
+	// Already assigned — sticky, but only while the replica still fits its
+	// node. Refresh the recorded request and keep it put if the (possibly
+	// grown) request still fits; otherwise release it here and fall through to
+	// re-place it, so a grown request or a shrunk node can't silently
+	// overcommit the node.
 	if nodeID, exists := s.assignments[replicaID]; exists {
-		s.requests[replicaID] = req
-		return types.Assignment{WorkloadID: replicaID, NodeID: nodeID, ParentID: s.parents[replicaID]}, nil
+		if s.fitsOnNode(nodeID, replicaID, req) {
+			s.requests[replicaID] = req
+			return types.Assignment{WorkloadID: replicaID, NodeID: nodeID, ParentID: s.parents[replicaID]}, nil
+		}
+		delete(s.assignments, replicaID)
+		delete(s.requests, replicaID)
+		delete(s.parents, replicaID)
 	}
 
 	nodes := s.registry.Alive()
@@ -116,6 +124,75 @@ func (s *Scheduler) Assign(replicaID, parentID string, req types.Resources) (typ
 	s.parents[replicaID] = parentID
 	s.requests[replicaID] = req
 	return types.Assignment{WorkloadID: replicaID, NodeID: best.id, ParentID: parentID}, nil
+}
+
+// NodeLoad reports a node's committed resource requests against its schedulable
+// capacity.
+type NodeLoad struct {
+	NodeID        string
+	CPUMillicores int // committed
+	MemoryMB      int // committed
+	CapCPU        int // schedulable
+	CapMemoryMB   int // schedulable
+}
+
+// fitsOnNode reports whether req fits on nodeID, counting everything already
+// committed there except replicaID's own current assignment. A node that is no
+// longer registered never fits. Callers must hold s.mu.
+func (s *Scheduler) fitsOnNode(nodeID, replicaID string, req types.Resources) bool {
+	node, ok := s.registry.Get(nodeID)
+	if !ok {
+		return false
+	}
+	capCPU, capMem := schedulable(node)
+	usedCPU, usedMem := 0, 0
+	for rID, nID := range s.assignments {
+		if nID != nodeID || rID == replicaID {
+			continue
+		}
+		r := s.requests[rID]
+		usedCPU += r.CPUMillicores
+		usedMem += r.MemoryMB
+	}
+	return usedCPU+req.CPUMillicores <= capCPU && usedMem+req.MemoryMB <= capMem
+}
+
+// Overcommitted returns nodes whose committed CPU or memory requests exceed
+// their schedulable capacity, sorted by node ID for stable output. This is a
+// safety net: best-fit placement prevents overcommit at assignment time, but a
+// node can still end up over capacity if it rejoins reporting less CPU/memory
+// than the load already placed on it.
+func (s *Scheduler) Overcommitted() []NodeLoad {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	usedCPU := make(map[string]int)
+	usedMem := make(map[string]int)
+	for rID, nodeID := range s.assignments {
+		r := s.requests[rID]
+		usedCPU[nodeID] += r.CPUMillicores
+		usedMem[nodeID] += r.MemoryMB
+	}
+
+	var out []NodeLoad
+	for nodeID := range usedCPU {
+		node, ok := s.registry.Get(nodeID)
+		if !ok {
+			continue
+		}
+		capCPU, capMem := schedulable(node)
+		if usedCPU[nodeID] > capCPU || usedMem[nodeID] > capMem {
+			out = append(out, NodeLoad{
+				NodeID:        nodeID,
+				CPUMillicores: usedCPU[nodeID],
+				MemoryMB:      usedMem[nodeID],
+				CapCPU:        capCPU,
+				CapMemoryMB:   capMem,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
 }
 
 // Unassign removes the assignment for a replica.

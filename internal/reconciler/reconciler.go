@@ -113,6 +113,12 @@ func (r *Reconciler) reconcile() error {
 	// drives the cluster toward this per-replica desired set.
 	desired := expand(stored)
 
+	// Surface any node whose committed requests exceed its schedulable
+	// capacity. Best-fit placement prevents this at assignment time, so a
+	// warning here means a node rejoined with less CPU/memory than the load
+	// already on it — worth seeing rather than inferring from a UI table.
+	r.logOvercommit()
+
 	// Detect dead nodes and evict their workloads back to unassigned.
 	for _, node := range r.registry.Dead() {
 		evicted := r.scheduler.ReassignNode(node.ID)
@@ -166,14 +172,25 @@ func (r *Reconciler) reconcile() error {
 		r.mu.Unlock()
 
 		switch {
-		case !pushedExists || rec.nodeID != assignment.NodeID:
-			// Initial placement, or the replica moved to a new node.
+		case !pushedExists:
+			// Initial placement.
 			if err := r.pushAssignment(node, inst.wl); err != nil {
 				log.Printf("reconciler: push assignment %s to %s: %v", inst.wl.ID, node.ID, err)
 				continue
 			}
 			r.recordPush(inst.wl.ID, assignment.NodeID, desiredHash)
 			log.Printf("reconciler: pushed %s to %s", inst.wl.ID, node.ID)
+
+		case rec.nodeID != assignment.NodeID:
+			// The replica moved to a new node (dead-node eviction, or a re-fit
+			// after its request outgrew the old node). Stop the old container
+			// before starting the new one so we never run two copies.
+			if err := r.relocate(rec.nodeID, node, inst.wl); err != nil {
+				log.Printf("reconciler: relocate %s to %s: %v", inst.wl.ID, node.ID, err)
+				continue
+			}
+			r.recordPush(inst.wl.ID, assignment.NodeID, desiredHash)
+			log.Printf("reconciler: relocated %s to %s (was on %s)", inst.wl.ID, node.ID, rec.nodeID)
 
 		case rec.specHash != desiredHash:
 			// Stale spec — roll it, but only a Running replica and only while
@@ -268,6 +285,29 @@ func sortedReplicaIDs(desired map[string]replicaInstance) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// relocate moves a replica from its old node to newNode: it stops the old
+// container first (if the old node is still registered) so a move never leaves
+// a duplicate — important for volume-backed workloads, where two live copies
+// would write the same data. A failure to stop the old container is logged but
+// not fatal; the start on the new node is what must succeed.
+func (r *Reconciler) relocate(oldNodeID string, newNode types.Node, w types.Workload) error {
+	if oldNode, ok := r.registry.Get(oldNodeID); ok {
+		if err := r.pushUnassign(oldNode, w.ID); err != nil {
+			log.Printf("reconciler: stop moved %s on old node %s: %v", w.ID, oldNodeID, err)
+		}
+	}
+	return r.pushAssignment(newNode, w)
+}
+
+// logOvercommit warns for each node whose committed resource requests exceed
+// its schedulable capacity.
+func (r *Reconciler) logOvercommit() {
+	for _, n := range r.scheduler.Overcommitted() {
+		log.Printf("reconciler: node %s overcommitted: cpu %d/%dm mem %d/%dMB",
+			n.NodeID, n.CPUMillicores, n.CapCPU, n.MemoryMB, n.CapMemoryMB)
+	}
 }
 
 // requestOf returns a workload's resource request for scheduling (its limits;
