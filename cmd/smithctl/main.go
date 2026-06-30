@@ -13,7 +13,7 @@ import (
 	"github.com/kkjorsvik/smith/internal/secrets"
 )
 
-const usage = "usage: smithctl [--config PATH] <apply|diff> [flags] <dir>"
+const usage = "usage: smithctl [--config PATH] <apply|diff|rebalance> [flags] [dir]"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -37,6 +37,8 @@ func run(args []string) error {
 		return runApply(*configPath, rest[1:])
 	case "diff":
 		return runDiff(*configPath, rest[1:])
+	case "rebalance":
+		return runRebalance(*configPath, rest[1:])
 	default:
 		return fmt.Errorf("unknown command %q\n%s", rest[0], usage)
 	}
@@ -72,6 +74,22 @@ func runDiff(configPath string, args []string) error {
 		return err
 	}
 	return apply.Diff(fs.Arg(0), client.New(cfg), os.Stdout)
+}
+
+func runRebalance(configPath string, args []string) error {
+	fs := flag.NewFlagSet("rebalance", flag.ContinueOnError)
+	doApply := fs.Bool("apply", false, "enact the rebalance (default is a dry-run preview)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: smithctl rebalance [--apply]")
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	return apply.Rebalance(client.New(cfg), *doApply, os.Stdout)
 }
 
 // loadConfig resolves the config path (defaulting when empty) and loads it.

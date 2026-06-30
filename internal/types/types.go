@@ -186,3 +186,11 @@ type Assignment struct {
 	NodeID     string `json:"node_id"`
 	ParentID   string `json:"parent_id,omitempty"`
 }
+
+// Move is a single replica relocation proposed or enacted by a rebalance:
+// ReplicaID moves from FromNode to ToNode.
+type Move struct {
+	ReplicaID string `json:"replica_id"`
+	FromNode  string `json:"from_node"`
+	ToNode    string `json:"to_node"`
+}

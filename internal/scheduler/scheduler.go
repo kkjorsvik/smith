@@ -84,8 +84,24 @@ func (s *Scheduler) Assign(replicaID, parentID string, req types.Resources) (typ
 		}
 	}
 
-	// Candidate nodes that fit the request, scored by remaining free fraction
-	// after placement (smaller = tighter pack = best-fit).
+	best := place(nodes, allocCPU, allocMem, siblings, req)
+	if best == "" {
+		return types.Assignment{}, fmt.Errorf("insufficient capacity for %s (cpu=%dm mem=%dMB)", replicaID, req.CPUMillicores, req.MemoryMB)
+	}
+
+	s.assignments[replicaID] = best
+	s.parents[replicaID] = parentID
+	s.requests[replicaID] = req
+	return types.Assignment{WorkloadID: replicaID, NodeID: best, ParentID: parentID}, nil
+}
+
+// place returns the best node ID for req given per-node committed resources
+// (allocCPU/allocMem) and same-parent sibling counts, or "" if no node fits.
+// Anti-affinity primary (fewest siblings), best-fit secondary (least remaining
+// capacity that still fits), node ID as a final deterministic tiebreak so
+// placement never depends on map-iteration order. Pure: callers supply the
+// accounting, so it serves both live Assign and rebalance simulation.
+func place(nodes []types.Node, allocCPU, allocMem, siblings map[string]int, req types.Resources) string {
 	type candidate struct {
 		id        string
 		siblings  int
@@ -107,23 +123,104 @@ func (s *Scheduler) Assign(replicaID, parentID string, req types.Resources) (typ
 		fitting = append(fitting, candidate{id: n.ID, siblings: siblings[n.ID], remaining: freeCPU + freeMem})
 	}
 	if len(fitting) == 0 {
-		return types.Assignment{}, fmt.Errorf("insufficient capacity for %s (cpu=%dm mem=%dMB)", replicaID, req.CPUMillicores, req.MemoryMB)
+		return ""
+	}
+	sort.Slice(fitting, func(i, j int) bool {
+		a, b := fitting[i], fitting[j]
+		if a.siblings != b.siblings {
+			return a.siblings < b.siblings
+		}
+		if a.remaining != b.remaining {
+			return a.remaining < b.remaining
+		}
+		return a.id < b.id
+	})
+	return fitting[0].id
+}
+
+// RebalancePlan simulates a fresh best-fit placement of all currently-assigned
+// replicas and returns the moves needed to reach it, without mutating any
+// state. Largest requests are placed first for tighter packing; placement is
+// deterministic, so re-planning an already-balanced cluster yields no moves.
+func (s *Scheduler) RebalancePlan() []types.Move {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.planLocked()
+}
+
+// Rebalance computes the plan and commits it, repointing assignments at the
+// target layout. The reconciler relocates the containers on its next pass.
+func (s *Scheduler) Rebalance() []types.Move {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	moves := s.planLocked()
+	for _, m := range moves {
+		s.assignments[m.ReplicaID] = m.ToNode
+	}
+	return moves
+}
+
+// planLocked computes rebalance moves by simulating a fresh placement of the
+// current replicas onto scratch accounting. Callers must hold s.mu.
+func (s *Scheduler) planLocked() []types.Move {
+	nodes := s.registry.Alive()
+	if len(nodes) == 0 {
+		return nil
 	}
 
-	// Anti-affinity primary (fewest siblings), best-fit tiebreak (least
-	// remaining capacity that still fits).
-	best := fitting[0]
-	for _, c := range fitting[1:] {
-		if c.siblings < best.siblings ||
-			(c.siblings == best.siblings && c.remaining < best.remaining) {
-			best = c
+	type replica struct {
+		id     string
+		parent string
+		req    types.Resources
+	}
+	replicas := make([]replica, 0, len(s.assignments))
+	for id := range s.assignments {
+		replicas = append(replicas, replica{id: id, parent: s.parents[id], req: s.requests[id]})
+	}
+	// Largest request first (better packing), then by ID for a deterministic,
+	// idempotent plan.
+	sort.Slice(replicas, func(i, j int) bool {
+		a, b := replicas[i], replicas[j]
+		if a.req.MemoryMB != b.req.MemoryMB {
+			return a.req.MemoryMB > b.req.MemoryMB
+		}
+		if a.req.CPUMillicores != b.req.CPUMillicores {
+			return a.req.CPUMillicores > b.req.CPUMillicores
+		}
+		return a.id < b.id
+	})
+
+	allocCPU := make(map[string]int)
+	allocMem := make(map[string]int)
+	target := make(map[string]string, len(replicas))
+	for _, r := range replicas {
+		siblings := make(map[string]int)
+		for id, node := range target {
+			if s.parents[id] == r.parent {
+				siblings[node]++
+			}
+		}
+		best := place(nodes, allocCPU, allocMem, siblings, r.req)
+		if best == "" {
+			continue // no node fits; leave it where it is
+		}
+		target[r.id] = best
+		allocCPU[best] += r.req.CPUMillicores
+		allocMem[best] += r.req.MemoryMB
+	}
+
+	var moves []types.Move
+	for _, r := range replicas {
+		to, ok := target[r.id]
+		if !ok {
+			continue
+		}
+		if from := s.assignments[r.id]; to != from {
+			moves = append(moves, types.Move{ReplicaID: r.id, FromNode: from, ToNode: to})
 		}
 	}
-
-	s.assignments[replicaID] = best.id
-	s.parents[replicaID] = parentID
-	s.requests[replicaID] = req
-	return types.Assignment{WorkloadID: replicaID, NodeID: best.id, ParentID: parentID}, nil
+	sort.Slice(moves, func(i, j int) bool { return moves[i].ReplicaID < moves[j].ReplicaID })
+	return moves
 }
 
 // NodeLoad reports a node's committed resource requests against its schedulable

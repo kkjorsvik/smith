@@ -104,6 +104,28 @@ func (c *Client) get(path string, out any) error {
 	return nil
 }
 
+// postInto issues an authenticated POST with no request body and decodes a 2xx
+// JSON response into out.
+func (c *Client) postInto(path string, out any) error {
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+path, nil)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return respError(path, resp)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("%s: decode: %w", path, err)
+	}
+	return nil
+}
+
 // del issues an authenticated DELETE; any 2xx is success.
 func (c *Client) del(path string) error {
 	req, err := http.NewRequest(http.MethodDelete, c.baseURL+path, nil)
@@ -144,6 +166,26 @@ func (c *Client) ListServices() ([]types.Service, error) {
 func (c *Client) ListIngresses() ([]types.Ingress, error) {
 	var out []types.Ingress
 	if err := c.get("/ingresses", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RebalancePlan returns the moves a rebalance would make via GET /rebalance,
+// without enacting them.
+func (c *Client) RebalancePlan() ([]types.Move, error) {
+	var out []types.Move
+	if err := c.get("/rebalance", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Rebalance enacts a rebalance via POST /rebalance and returns the moves
+// committed.
+func (c *Client) Rebalance() ([]types.Move, error) {
+	var out []types.Move
+	if err := c.postInto("/rebalance", &out); err != nil {
 		return nil, err
 	}
 	return out, nil

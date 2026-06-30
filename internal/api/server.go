@@ -142,6 +142,8 @@ func (s *Server) Start() {
 	publicMux.HandleFunc("GET /status", s.requireAuth(s.status))
 	publicMux.HandleFunc("GET /nodes", s.requireAuth(s.listNodes))
 	publicMux.HandleFunc("GET /assignments", s.requireAuth(s.listAssignments))
+	publicMux.HandleFunc("GET /rebalance", s.requireAuth(s.rebalancePlan))
+	publicMux.HandleFunc("POST /rebalance", s.requireAuth(s.rebalance))
 	publicMux.HandleFunc("GET /workloads/{id}/logs", s.requireAuth(s.workloadLogs))
 	publicMux.HandleFunc("DELETE /nodes/{id}", s.requireAuth(s.removeNode))
 	publicMux.HandleFunc("POST /services", s.requireAuth(s.addService))
@@ -556,6 +558,17 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listAssignments(w http.ResponseWriter, r *http.Request) {
 	assignments := s.scheduler.ListAssignments()
 	writeJSON(w, http.StatusOK, assignments)
+}
+
+// rebalancePlan returns the moves a rebalance would make, without enacting them.
+func (s *Server) rebalancePlan(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.scheduler.RebalancePlan())
+}
+
+// rebalance enacts a rebalance and returns the moves committed. The reconciler
+// relocates the containers on its next pass.
+func (s *Server) rebalance(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.scheduler.Rebalance())
 }
 
 // nodeRoutes returns the cross-node routing table for the requesting node:
